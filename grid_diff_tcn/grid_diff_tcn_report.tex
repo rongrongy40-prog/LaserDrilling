@@ -1,0 +1,225 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage[left=2.2cm,right=2.2cm,top=2.2cm,bottom=2.4cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{teal},
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{black!20},
+  showstringspaces=false
+}
+
+\title{Grid-Diff TCN（含概率 Transformer 与不确定性门控）\\模型、方法与结果说明}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文档仅介绍：\textbf{模型结构}（TCN 与可选概率 Transformer 的协同方式）、\textbf{决策方法}（安全锁、TopKMedian 与可选不确定性门控）、以及\textbf{实验结果}（训练集、测试集与合并指标）。不包含任何代码、脚本或实现细节。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{任务定义与输入输出}
+
+\paragraph{任务}
+给定单孔逐层图像序列，输出：
+\begin{itemize}
+  \item 是否穿透（0/1）
+  \item 若穿透：穿透发生的层位置（以层索引或层号表示）
+\end{itemize}
+
+\paragraph{特征表示（Grid-Diff）}
+将原始图像序列变换为逐层 64 维特征序列 \(\mathbf{X}\in\mathbb{R}^{T\times 64}\)（\(T\) 为层数）。该特征遵循物理先验：穿透前后层间变化更显著。
+
+\subsection{Grid-Diff 特征构造（概念描述）}
+对每个孔，将图像序列转为逐层 64 维特征序列，核心步骤如下：
+\begin{enumerate}
+  \item \textbf{层内融合（Layer mean）}：同一层可能有多张图片，将其像素均值作为该层代表图 \(I_n\)。
+  \item \textbf{灰度化（可选）}：按 \(0.299R+0.587G+0.114B\) 转灰度。
+  \item \textbf{帧间差分（Temporal abs diff）}：\[
+    D_0 = I_0,\quad D_n = |I_n - I_{n-1}|\ (n\ge 1)
+  \]
+  \item \textbf{ROI 裁剪}：可采用严格中心裁剪，或采用给定中心比例 \((c_y,c_x)\) 的偏移裁剪。
+  \item \textbf{8$\times$8 网格池化}：将 ROI 划分为 8$\times$8 共 64 个 patch，每个 patch 取均值，得到每层 64 维向量。
+\end{enumerate}
+最终得到单孔特征张量 \(\mathbf{X}\in\mathbb{R}^{T\times 64}\)，其中 \(T\) 为该孔可用层数。
+
+\section{模型结构}
+
+\subsection{基础因果 1D-TCN（Backbone）}
+\paragraph{输入输出}
+\[
+\text{输入 }(B,64,T)\ \xrightarrow{\text{TCN}}\ \text{logits }(B,2,T)
+\]
+
+\paragraph{TCNBlock}
+每层采用因果膨胀卷积（dilation \(2^i\) 递增）、BatchNorm、ReLU 与残差连接。由于卷积使用左侧 padding 并裁剪输出，保证时刻 \(t\) 仅依赖 \(\le t\) 的历史信息，不泄漏未来。
+
+\subsection{TCN + 概率 Transformer（可选）}
+
+\paragraph{整体结构（协同方式）}
+\begin{enumerate}
+  \item \textbf{TCN 前端：}将 64 维物理特征变换为更可分的时序表征（强调局部/中程模式，保持因果性）。
+  \item \textbf{投影层：}将 TCN 输出通道映射到 Transformer 的 \(d_{\text{model}}\) 维度，并把张量转为序列表示。
+  \item \textbf{Transformer 编码器：}在 TCN 表征上建模长程依赖；其注意力为概率形式，可在多次前向中产生分布性。
+  \item \textbf{输出头：}将编码后的序列逐层映射为二分类 logits。
+\end{enumerate}
+
+\paragraph{概率自注意力（K/V 重参数化）}
+对输入序列 \(\mathbf{h}\in\mathbb{R}^{B\times T\times D}\)：
+\begin{itemize}
+  \item 线性映射得到 \(q,k,v\) 的高斯分布参数：\(\mu_q,\log\sigma_q^2,\mu_k,\log\sigma_k^2,\mu_v,\log\sigma_v^2\)。
+  \item 当前实现仅对 \(K,V\) 采样，\(Q\) 使用均值：\[
+    K=\mu_k+\sigma_k\odot\epsilon_k,\quad V=\mu_v+\sigma_v\odot\epsilon_v,\quad \epsilon\sim\mathcal{N}(0,I)
+  \]
+  \item 标准缩放点积注意力：\(\mathrm{softmax}(QK^\top/\sqrt{d_k})V\)。
+\end{itemize}
+
+\paragraph{KL 正则（可选）}
+在使用 KL 正则的设置下，会对 \(V\) 的分布加入与标准正态的 KL：
+\[
+\mathrm{KL}( \mathcal{N}(\mu,\sigma^2) \Vert \mathcal{N}(0,1) )
+= -\frac{1}{2}\left(1+\log\sigma^2-\mu^2-\sigma^2\right)
+\]
+训练时通过一个非负超参数 \(\lambda_{\mathrm{KL}}\) 控制其权重。
+
+\paragraph{MC 不确定性估计（概念）}
+若进行 \(K>1\) 次独立前向，可得到每层穿透概率样本 \(p^{(k)}_t\)。据此计算：
+\[
+\bar{p}_t=\frac{1}{K}\sum_{k=1}^K p^{(k)}_t,\quad
+\mathrm{Var}(p_t)=\frac{1}{K}\sum_{k=1}^K (p^{(k)}_t-\bar{p}_t)^2
+\]
+并在后续决策中可选使用方差作为“不确定性”信号。
+
+\section{推理与决策方法}
+
+\subsection{安全锁（Safety lock）}
+推理时先对概率曲线做安全锁：将前 \(L_{\text{lock}}\)（默认取 30）层穿透概率强制置 0，避免物理上不可能的早期穿透误判。
+
+\subsection{TopKMedian（推荐决策）}
+TopKMedian 的核心规则：
+\begin{enumerate}
+  \item 取概率最大的 \(k\) 层的索引集合 \(\mathcal{K}\)；
+  \item 若这 \(k\) 个概率值的中位数 \(< \tau\)，则判未穿透；
+  \item 否则判穿透，预测层索引为 \(\mathcal{K}\) 的索引中位数（抗尖峰与噪声）。
+\end{enumerate}
+
+\subsection{不确定性门控（可选）}
+推理可选用多次采样与不确定性门控：
+\begin{itemize}
+  \item 对 Transformer 模型，若进行多次采样（\(K>1\)），可在推理阶段对注意力进行采样，多次前向得到 \(\bar{p},\mathrm{Var}(p)\)；
+  \item 决策在 \(\bar{p}\) 上做 TopKMedian；
+  \item 若 \(\mathrm{median}(\mathrm{Var}(p_t)\_{t\in\mathcal{K}})\) 超阈值，则将判穿透改为未穿透。
+\end{itemize}
+
+\section{指标定义}
+
+\subsection{按孔指标（仅穿透孔）}
+仅对标注为穿透的孔统计层误差。令 \(t^\*\) 为真实穿透层索引，\(\hat{t}\) 为模型给出的穿透层索引（若门控否决则可能不存在），则：
+\[
+e = 
+\begin{cases}
+|\hat{t}-t^\*|, & \hat{t}\ \text{存在且}\ t^\* \text{存在}\\
+999, & \hat{t}\ \text{不存在（例如被不确定性门控否决）}
+\end{cases}
+\]
+并统计：
+\begin{itemize}
+  \item 误差 \(\le 3\) 层占比
+  \item 误差 \(\le 5\) 层占比
+  \item 误差 \(> 10\) 层占比
+\end{itemize}
+
+\section{实验结果（train / test / combined）}
+本节汇报离线决策搜索得到的当前最优版本（以合并指标的“误差$\le 5$层占比”最大为目标）。
+
+\paragraph{最优决策（合并集最优）}
+基于 TopKMedian 的不确定性感知版本（风险惩罚 + 不确定性门控）：
+\begin{itemize}
+  \item TopKMedian：\(k=7\)，阈值 \(\tau=0.30\)
+  \item 风险惩罚：\(s(t)=p(t)-\beta\sqrt{\mathrm{Var}(p_t)}\)，其中 \(\beta=0.25\)
+  \item 门控（强硬）：若预测位置的不确定性（方差）超过阈值 \(v_{\text{th}}=0.002\)，则否决该预测（判为未穿透）
+\end{itemize}
+下表为该最优决策在训练集、测试集与合并集上的按孔指标（仅穿透孔）。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+数据集 & 穿透孔数 & 误差$\le 3$层(\%) & 误差$\le 5$层(\%) & 误差$>10$层(\%) \\
+\midrule
+训练集 & 820 & 55.00 & 68.29 & 20.37 \\
+测试集 & 205 & 52.20 & 64.88 & 26.83 \\
+合并（按穿透孔数加权） & 1025 & 54.44 & 67.61 & 21.66 \\
+\bottomrule
+\end{tabular}
+\caption{最优决策版本的按孔指标汇总（仅统计标注为穿透的孔）}
+\end{table}
+
+\section{Badcase / Goodcase 可视化}
+\subsection{总体对比图}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.86\linewidth]{badcase_report_current/scatter_combined.png}
+  \caption{真实穿透层索引 vs 预测穿透层索引散点图（仅穿透孔）。颜色表示绝对误差 \(|\hat{t}-t^\*|\)。}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.86\linewidth]{badcase_report_current/err_hist_combined.png}
+  \caption{绝对误差直方图（仅穿透孔）。}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.86\linewidth]{badcase_report_current/err_cdf_combined.png}
+  \caption{绝对误差的 CDF（仅穿透孔）。}
+\end{figure}
+
+\subsection{概率曲线：坏例（Badcase）}
+下图给出两个代表性坏例的概率曲线（并叠加均值/方差曲线）：绿线为真实穿透层索引，红线为预测索引。
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{badcase_report_current/curves/03_test_9-2_2024_08_13_19_59_44_725_err56.png}
+  \caption{Badcase 示例 1：出现长平台或后段整体高置信，导致预测偏后。}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{badcase_report_current/curves/00_train_12-1_2024_11_30_01_36_19_726_err87.png}
+  \caption{Badcase 示例 2：极端大误差案例（仅示意）。}
+\end{figure}
+
+\subsection{概率曲线：好例（Goodcase）}
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{badcase_report_current/good_curves/02_10-6_2024_12_14_03_24_15_083_err0.png}
+  \caption{Goodcase 示例：预测与真实一致（误差 0），概率曲线在真实穿透位置附近具有清晰结构。}
+\end{figure}
+
+\end{document}
+

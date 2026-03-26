@@ -1,0 +1,51 @@
+# =============================================================================
+# 策略：仓库根目录只入库 grid_diff_tcn/ 下的「代码与文档」
+# （.py / .sh / .md / .txt / .yaml|.yml / .toml / .tex）
+# 其余路径一律忽略；大文件、特征缓存、嵌套 .git 等即便在子目录也不跟踪。
+# =============================================================================
+
+# 忽略所有文件（任意层级）
+*
+# 保留目录结构，否则无法对子目录里的文件做「反向忽略」
+!*/
+# 本规则文件需要入库
+!.gitignore
+
+# ---- grid_diff_tcn：仅这些后缀入库 ----
+!grid_diff_tcn/**/*.py
+!grid_diff_tcn/**/*.sh
+!grid_diff_tcn/**/*.md
+!grid_diff_tcn/**/*.txt
+!grid_diff_tcn/**/*.yaml
+!grid_diff_tcn/**/*.yml
+!grid_diff_tcn/**/*.toml
+!grid_diff_tcn/**/*.tex
+
+# 嵌套的独立 git 仓库（勿并进主仓库）
+grid_diff_tcn/.git/
+
+# ---- grid_diff_tcn 内仍可再排除（Python 缓存等）----
+grid_diff_tcn/**/__pycache__/
+grid_diff_tcn/**/*.py[cod]
+grid_diff_tcn/**/.pytest_cache/
+grid_diff_tcn/**/.mypy_cache/
+grid_diff_tcn/**/.ruff_cache/
+
+# 数据与生成物（即使以后扩展名规则放宽，也保持忽略）
+grid_diff_tcn/**/cache_features_train/
+grid_diff_tcn/**/cache_features*/
+grid_diff_tcn/**/*.pt
+grid_diff_tcn/**/*.pth
+grid_diff_tcn/**/*.ckpt
+grid_diff_tcn/**/*.npy
+grid_diff_tcn/**/*.npz
+grid_diff_tcn/**/*.png
+grid_diff_tcn/**/*.jpg
+grid_diff_tcn/**/*.jpeg
+grid_diff_tcn/**/*.json
+grid_diff_tcn/**/*.csv
+grid_diff_tcn/**/*.log
+
+# 若 grid_diff_tcn 内仍存在旧的 .git/，Git 会把该目录当成「嵌入式仓库」，
+# 主仓库无法正常跟踪其中的 .py 等文件。需要扁平入库时请先删除：
+#   rm -rf grid_diff_tcn/.git
