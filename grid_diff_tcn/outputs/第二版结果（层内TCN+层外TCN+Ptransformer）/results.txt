@@ -1,0 +1,15 @@
+Hierarchical inference weighted full metrics
+===========================================
+测试集：Done. n_pen=299 <=3:65.2% <=5:79.3% >10:8.4%
+训练集：Done. n_pen=1194 <=3:66.2% <=5:82.1% >10:6.6%
+
+All data (Train + Test, weighted by penetrated-hole count)
+- n_pen_total: 1493
+- <=3: 65.97%
+- <=5: 81.51%
+- >10: 6.97%
+
+Raw counts
+- <=3 count: 985
+- <=5 count: 1217
+- >10 count: 104
