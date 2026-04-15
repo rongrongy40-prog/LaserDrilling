@@ -76,7 +76,9 @@ class ProbabilisticSelfAttention(nn.Module):
 
         extra: Dict[str, Any] = {}
         if self.add_kl:
-            extra["kl_loss"] = self._kl_standard_normal(v_mu, v_logvar).mean()
+            kl_k = self._kl_standard_normal(k_mu, k_logvar).mean()
+            kl_v = self._kl_standard_normal(v_mu, v_logvar).mean()
+            extra["kl_loss"] = 0.5 * (kl_k + kl_v)
         if need_weights:
             extra["attn_weights"] = attn_weights
         return out, extra

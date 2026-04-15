@@ -1,12 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Hierarchical dataset for frame-level + layer-level modeling.
-
-Returns per-sample tensors:
-  - frame_data: (T, F, 192)  per-layer per-frame grid features (8*8*3: mean+std+max)
-  - frame_mask: (T, F)       valid frame mask
-  - seq_label:  (T,)         per-layer binary label
-  - layer_list: list[int]
+Hierarchical dataset using DINOv3 features instead of hand-crafted grid features.
+Each frame ROI is passed through DinoV3FeatureExtractor to produce a 768-dim (ViT-B)
+CLS token feature, then fed into the HierarchicalGridDiffProbTransformer.
 """
 
 from __future__ import annotations
@@ -33,203 +29,74 @@ from grid_diff_tcn.common.image_ops import (
     _crop,
     _resize_rgb_letterbox,
 )
+from grid_diff_tcn.hier.frame_layer.dataset import compute_layer_extra_features
 
-def _pool_regions_8x8(x_btf: torch.Tensor) -> torch.Tensor:
+
+def _default_dinov3_transform(
+    roi: np.ndarray, target_size: int = 224
+) -> torch.Tensor:
     """
-    x_btf: (B,T,F,C) float
-      C = 64  → 8*8 grid, 1 stat per cell
-      C = 192 → 8*8 grid, 3 stats per cell (mean+std+max)
-    return: (B,T,F,5) float
-      5 regions = [center2x2, top, bottom, left, right]
-      每个 region 对所有 stat 维度取平均
+    Convert an ROI array to a (3, H, W) float tensor in [0, 1],
+    resized to target_size (making dimensions divisible by 16).
+
+    Args:
+        roi: (H, W, 3) uint8 or float32, assumed to be RGB
+        target_size: final width/height after resize (must be divisible by 16)
+
+    Returns:
+        (3, target_size, target_size) float32 tensor in [0, 1]
     """
-    b, t, f, c = x_btf.shape
-    n_cell = 8 * 8
-    if c == n_cell:
-        # 单统计量：直接 reshape
-        g = x_btf.view(b, t, f, 8, 8)
-    elif c == n_cell * 3:
-        # 3 统计量 (mean,std,max)：reshape 为 (B,T,F,8,8,3)
-        g = x_btf.view(b, t, f, 8, 8, 3)
+    if roi.dtype != np.float32 and roi.dtype != np.float64:
+        roi = roi.astype(np.float32) / 255.0
     else:
-        raise ValueError(f"_pool_regions_8x8: expected C=64 or 192, got C={c}")
-    center = g[..., 3:5, 3:5, :].mean(dim=(-1, -2, -3))
-    top    = g[..., :2, :, :].mean(dim=(-1, -2, -3))
-    bottom = g[..., -2:, :, :].mean(dim=(-1, -2, -3))
-    left   = g[..., :, :2, :].mean(dim=(-1, -2, -3))
-    right  = g[..., :, -2:, :].mean(dim=(-1, -2, -3))
-    return torch.stack([center, top, bottom, left, right], dim=-1)
+        roi = roi.astype(np.float32)
+    if roi.max() > 1.0:
+        roi = roi / 255.0
+
+    # target dimensions must be divisible by patch_size=16
+    h, w = roi.shape[:2]
+    target_h = target_size
+    target_w = target_size
+
+    if h != target_h or w != target_w:
+        import cv2
+
+        roi = cv2.resize(roi, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    tensor = torch.from_numpy(roi).permute(2, 0, 1).float()  # (3, H, W)
+    return tensor
 
 
-def _masked_mean_var(x: torch.Tensor, m: torch.Tensor, dim: int, eps: float = 1e-6):
+class HierarchicalDinoV3Dataset(Dataset):
     """
-    x: (..., F, D)
-    m: (..., F) in {0,1}
-    returns (mean, var): (..., D)
+    Hierarchical dataset that extracts DINOv3 features per frame.
+
+    Replaces the hand-crafted 8x8 grid features (192-dim) with DINOv3 ViT-B
+    CLS token features (768-dim). All other dataset mechanics
+    (layer sampling, frame selection, precomputed cache, etc.) are identical
+    to the parent HierarchicalFrameLayerDataset.
+
+    Args:
+        samples_info_path: path to samples_info JSON
+        dinov3_extractor: an initialized DinoV3FeatureExtractor (default None,
+            only needed when not using precomputed_dir)
+        dinov3_feat_dim: dimension of DINOv3 features (default 768 for ViT-B)
+        roi_size: size of ROI crop (default 224, recommended for DINOv3)
+        target_size: resize target (default (224, 224))
+        max_layers, max_frames_per_layer, penetration_radius, etc.:
+            see HierarchicalFrameLayerDataset
+        precomputed_dir: if provided, load cached features from this directory
+            instead of running DINOv3 at data loading time
+        **kwargs: passed through to HierarchicalFrameLayerDataset init
     """
-    m = m.to(dtype=x.dtype)
-    denom = m.sum(dim=dim, keepdim=True).clamp(min=1.0).unsqueeze(-1)  # align with (...,1,D)
-    mean = (x * m.unsqueeze(-1)).sum(dim=dim, keepdim=True) / denom
-    var = ((x - mean) ** 2 * m.unsqueeze(-1)).sum(dim=dim, keepdim=True) / denom.clamp(min=eps)
-    return mean.squeeze(dim), var.squeeze(dim)
 
-
-def _safe_lag1_corr(x: torch.Tensor, m: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """
-    x: (B,T,F,D)
-    m: (B,T,F) bool
-    returns: (B,T,D) correlation between x[t] and x[t-1] over valid pairs
-    """
-    if x.size(2) <= 1:
-        return torch.zeros(x.size(0), x.size(1), x.size(3), device=x.device, dtype=x.dtype)
-    x0 = x[:, :, :-1, :]
-    x1 = x[:, :, 1:, :]
-    mp = (m[:, :, :-1] & m[:, :, 1:]).to(dtype=x.dtype)
-    mean0, var0 = _masked_mean_var(x0, mp, dim=2, eps=eps)
-    mean1, var1 = _masked_mean_var(x1, mp, dim=2, eps=eps)
-    cov = ((x0 - mean0.unsqueeze(2)) * (x1 - mean1.unsqueeze(2)) * mp.unsqueeze(-1)).sum(dim=2)
-    denom = mp.sum(dim=2).clamp(min=1.0).unsqueeze(-1)
-    cov = cov / denom
-    corr = cov / (var0.clamp(min=eps).sqrt() * var1.clamp(min=eps).sqrt())
-    return torch.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
-
-
-def _rfft_band_energy(x: torch.Tensor, m: torch.Tensor, n_bands: int = 3, eps: float = 1e-8) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    x: (B,T,F,D)
-    m: (B,T,F) bool
-    returns:
-      - band_energy_ratio: (B,T,D,n_bands)
-      - spectral_entropy: (B,T,D)
-    """
-    b, t, f, d = x.shape
-    xf = x * m.to(dtype=x.dtype).unsqueeze(-1)
-    # rfft along F, take power
-    spec = torch.fft.rfft(xf, dim=2)
-    p = (spec.real**2 + spec.imag**2)  # (B,T,Fr,D)
-    # ignore DC for stability
-    if p.size(2) > 1:
-        p_use = p[:, :, 1:, :]
-    else:
-        p_use = p
-    total = p_use.sum(dim=2, keepdim=False).clamp(min=eps)  # (B,T,D)
-    # bands over frequency bins
-    fr = int(p_use.size(2))
-    if fr == 0:
-        ber = torch.zeros(b, t, d, n_bands, device=x.device, dtype=x.dtype)
-        se = torch.zeros(b, t, d, device=x.device, dtype=x.dtype)
-        return ber, se
-    edges = torch.linspace(0, fr, steps=n_bands + 1, device=x.device)
-    bands = []
-    for i in range(n_bands):
-        lo = int(edges[i].item())
-        hi = int(edges[i + 1].item())
-        hi = max(hi, lo + 1)
-        hi = min(hi, fr)
-        seg = p_use[:, :, lo:hi, :].sum(dim=2)  # (B,T,D)
-        bands.append(seg / total)
-    ber = torch.stack(bands, dim=-1)  # (B,T,D,n_bands)
-    # spectral entropy
-    prob = p_use / total.unsqueeze(2)
-    ent = -(prob.clamp(min=eps) * prob.clamp(min=eps).log()).sum(dim=2)  # (B,T,D)
-    ent = ent / float(max(1, fr))  # normalize roughly
-    return ber, torch.nan_to_num(ent, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def compute_layer_extra_features(frame_data: torch.Tensor, frame_mask: torch.Tensor) -> torch.Tensor:
-    """
-    frame_data: (B,T,F,192)
-    frame_mask: (B,T,F) bool
-    return layer_extra: (B,T,E) float
-    E = 5 regions * (mean,std,diff_l1,lag1_corr) + 5 regions * (band1,band2,band3,spec_entropy) + 1 valid_ratio
-      = 5*4 + 5*4 + 1 = 41
-    """
-    x = frame_data
-    m = frame_mask.to(dtype=torch.bool)
-    regions = _pool_regions_8x8(x)  # (B,T,F,5)
-    valid_ratio = m.to(dtype=regions.dtype).mean(dim=2, keepdim=False)  # (B,T)
-
-    mean_r, var_r = _masked_mean_var(regions, m, dim=2)
-    std_r = var_r.clamp(min=1e-8).sqrt()
-    # diff L1 energy
-    if regions.size(2) > 1:
-        dr = (regions[:, :, 1:, :] - regions[:, :, :-1, :]).abs()
-        md = (m[:, :, 1:] & m[:, :, :-1])
-        diff_mean, _ = _masked_mean_var(dr, md, dim=2)
-    else:
-        diff_mean = torch.zeros_like(mean_r)
-    lag1 = _safe_lag1_corr(regions, m)
-    ber, sent = _rfft_band_energy(regions, m, n_bands=3)
-
-    # flatten
-    feats = [
-        mean_r,
-        std_r,
-        diff_mean,
-        lag1,
-        ber.reshape(ber.size(0), ber.size(1), -1),
-        sent,
-        valid_ratio.unsqueeze(-1),
-    ]
-    out = torch.cat(feats, dim=-1)
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def _grid_pool_single(
-    gray_roi: np.ndarray,
-    grid: Tuple[int, int] = (8, 8),
-    pool_stats: Tuple[str, ...] = ("mean", "std", "max"),
-) -> np.ndarray:
-    """
-    每个 grid patch 输出多个统计量，扩展特征维度。
-
-    gray_roi: (H, W) float32 灰度图
-    grid: (rows, cols) 网格划分
-    pool_stats: 每个 patch 提取哪些统计量，支持 "mean", "std", "max"
-    return: (grid_rows * grid_cols * len(pool_stats),) float32
-    """
-    h, w = gray_roi.shape[:2]
-    gr, gc = int(grid[0]), int(grid[1])
-    n_stats = len(pool_stats)
-    n_cell = gr * gc
-    feat_dim = n_cell * n_stats
-
-    if h < gr or w < gc:
-        return np.zeros((feat_dim,), dtype=np.float32)
-
-    ph, pw = h // gr, w // gc
-    out = np.zeros((feat_dim,), dtype=np.float32)
-    k = 0
-    for r in range(gr):
-        for c in range(gc):
-            patch = gray_roi[r * ph : (r + 1) * ph, c * pw : (c + 1) * pw]
-            if patch.size == 0:
-                out[k : k + n_stats].fill(0.0)
-                k += n_stats
-                continue
-            vals = patch.ravel()
-            for stat in pool_stats:
-                if stat == "mean":
-                    out[k] = float(np.mean(vals))
-                elif stat == "std":
-                    out[k] = float(np.std(vals))
-                elif stat == "max":
-                    out[k] = float(np.max(vals))
-                else:
-                    out[k] = 0.0
-                k += 1
-    return out
-
-
-class HierarchicalFrameLayerDataset(Dataset):
     def __init__(
         self,
         samples_info_path: str,
-        base_dir: str | None = None,
-        target_size: Tuple[int, int] = (128, 128),
-        roi_size: int = 96,
-        grid: Tuple[int, int] = (8, 8),
-        pool_stats: Tuple[str, ...] = ("mean", "std", "max"),
+        dinov3_extractor: torch.nn.Module | None = None,
+        dinov3_feat_dim: int = 768,
+        roi_size: int = 224,
+        target_size: Tuple[int, int] = (224, 224),
         max_layers: int | None = None,
         max_frames_per_layer: int = 8,
         penetration_radius: int = 2,
@@ -245,7 +112,8 @@ class HierarchicalFrameLayerDataset(Dataset):
         use_color_cc_v2_geometry: bool = True,
         precomputed_dir: str | None = None,
         use_grayscale: bool = False,
-        **_ignored_legacy_kwargs,
+        _dinov3_target_size: int = 224,
+        **_ignored_kwargs,
     ) -> None:
         super().__init__()
         with open(samples_info_path, "r", encoding="utf-8") as f:
@@ -258,8 +126,6 @@ class HierarchicalFrameLayerDataset(Dataset):
         self.samples: List[dict] = []
         for it in raw:
             p = str(it.get("sample_path", ""))
-            if base_dir and not os.path.isabs(p):
-                p = os.path.join(base_dir, p)
             self.samples.append(
                 {
                     "sample_path": p,
@@ -268,11 +134,9 @@ class HierarchicalFrameLayerDataset(Dataset):
                 }
             )
 
-        self.target_size = target_size
+        self._feat_dim = int(dinov3_feat_dim)
         self.roi_size = int(roi_size)
-        self.grid = grid
-        self.pool_stats = tuple(pool_stats)
-        self._feat_dim = int(grid[0]) * int(grid[1]) * len(self.pool_stats)
+        self.target_size = target_size
         self.max_layers = max_layers
         self.max_frames_per_layer = int(max_frames_per_layer)
         self.penetration_radius = int(max(0, penetration_radius))
@@ -289,6 +153,14 @@ class HierarchicalFrameLayerDataset(Dataset):
         self.use_color_cc_v2_geometry = bool(use_color_cc_v2_geometry)
         self.precomputed_dir = os.path.abspath(precomputed_dir) if precomputed_dir else None
         self.use_grayscale = bool(use_grayscale)
+        self._dinov3_target_size = int(_dinov3_target_size)
+
+        # DINOv3 extractor (can be None when using precomputed_dir)
+        self._dinov3_extractor = dinov3_extractor
+        if self._dinov3_extractor is not None:
+            self._dinov3_extractor.eval()
+            for param in self._dinov3_extractor.parameters():
+                param.requires_grad = False
 
         # Precomputed name: use sample_path directly, with slashes replaced for filesystem safety
         self._precomputed_name_for_idx: List[str] = []
@@ -299,6 +171,10 @@ class HierarchicalFrameLayerDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    @property
+    def feat_dim(self) -> int:
+        return self._feat_dim
 
     def _build_layer_dict(self, sample_path: str) -> Dict[int, List[Tuple[int, str]]]:
         by = defaultdict(list)
@@ -321,13 +197,15 @@ class HierarchicalFrameLayerDataset(Dataset):
         idx = np.linspace(0, len(paths) - 1, self.max_frames_per_layer, dtype=int)
         return [paths[i] for i in idx]
 
-    def _extract_frame_feature(
-        self,
-        img_path: str,
-    ) -> np.ndarray | None:
+    def _extract_frame_feature(self, img_path: str) -> np.ndarray | None:
+        """
+        Extract a DINOv3 feature from a single frame image path.
+        Returns a (dinov3_feat_dim,) numpy array or None on failure.
+        """
         img = load_image_as_float(img_path, self.target_size)
         if img is None:
             return None
+
         if self.use_grayscale:
             gray = to_grayscale(img)
             roi = color_cc_extract_gray_letterbox(
@@ -364,12 +242,24 @@ class HierarchicalFrameLayerDataset(Dataset):
             if roi.size == 0:
                 return None
             roi = _resize_rgb_letterbox(roi, (self.roi_size, self.roi_size), pad_value=0.0)
-        
+
         if roi is None or roi.size == 0:
             return None
-        return _grid_pool_single(roi, grid=self.grid, pool_stats=self.pool_stats)
+
+        # Convert to tensor and extract DINOv3 feature
+        tensor = _default_dinov3_transform(roi, target_size=self._dinov3_target_size)
+        tensor = tensor.unsqueeze(0)  # (1, 3, H, W)
+
+        with torch.inference_mode():
+            feat = self._dinov3_extractor(tensor)
+            if isinstance(feat, tuple):
+                feat = torch.cat(feat, dim=-1)
+            feat = feat.squeeze(0).cpu().numpy()
+
+        return feat.astype(np.float32)
 
     def __getitem__(self, index: int) -> dict:
+        # --- try precomputed cache first ---
         if self.precomputed_dir:
             pt_path = os.path.join(self.precomputed_dir, self._precomputed_name_for_idx[index])
             if not os.path.isfile(pt_path):
@@ -378,7 +268,17 @@ class HierarchicalFrameLayerDataset(Dataset):
                 raw = torch.load(pt_path, map_location="cpu")
                 frame_data = raw["frame_data"]
                 frame_mask = raw["frame_mask"]
-                # 兼容：预计算缓存与当前 max_frames_per_layer 不一致时，自动裁剪/补零
+
+                # Align seq_label T to frame_data T (cache may have mismatch)
+                seq_label = raw["seq_label"]
+                if seq_label.ndim == 1:
+                    src_t = int(frame_data.shape[0])
+                    if seq_label.shape[0] < src_t:
+                        seq_label = F.pad(seq_label, (0, src_t - seq_label.shape[0]))
+                    elif seq_label.shape[0] > src_t:
+                        seq_label = seq_label[:src_t]
+                    seq_label = seq_label.clone()
+
                 target_f = int(self.max_frames_per_layer)
                 src_f = int(frame_data.shape[1]) if frame_data.ndim >= 2 else target_f
                 if src_f != target_f:
@@ -391,15 +291,23 @@ class HierarchicalFrameLayerDataset(Dataset):
                     adj_mask[:, :copy_f] = frame_mask[:, :copy_f].to(torch.bool)
                     frame_data = adj_data
                     frame_mask = adj_mask
+
                 return {
                     "frame_data": frame_data,
                     "frame_mask": frame_mask,
-                    "seq_label": raw["seq_label"],
+                    "seq_label": seq_label,
                     "label": int(raw.get("label", 0)),
                     "penetration_layer": int(raw.get("penetration_layer", -1)),
                     "layer_list": [int(x) for x in raw.get("layer_list", [])],
                     "sample_path": raw.get("sample_path", self.samples[index].get("sample_path", "")),
                 }
+
+        # --- extract on the fly ---
+        if self._dinov3_extractor is None:
+            raise RuntimeError(
+                "HierarchicalDinoV3Dataset: dinov3_extractor is None and no "
+                "precomputed_dir is set. Cannot extract features on the fly."
+            )
 
         sample = self.samples[index]
         sample_path = sample["sample_path"]
@@ -409,7 +317,9 @@ class HierarchicalFrameLayerDataset(Dataset):
             layer_list = layer_list[: int(self.max_layers)]
 
         if not layer_list:
-            frame_data = torch.zeros(1, self.max_frames_per_layer, self._feat_dim, dtype=torch.float32)
+            frame_data = torch.zeros(
+                1, self.max_frames_per_layer, self._feat_dim, dtype=torch.float32
+            )
             frame_mask = torch.zeros(1, self.max_frames_per_layer, dtype=torch.bool)
             seq_label = torch.zeros(1, dtype=torch.long)
             return {
@@ -451,55 +361,3 @@ class HierarchicalFrameLayerDataset(Dataset):
             "layer_list": layer_list,
             "sample_path": sample_path,
         }
-
-
-def collate_hierarchical_batch(batch: List[dict]) -> dict:
-    max_t = max(int(b["frame_data"].shape[0]) for b in batch) if batch else 1
-    f = int(batch[0]["frame_data"].shape[1]) if batch else 1
-    c = int(batch[0]["frame_data"].shape[2]) if batch else 192
-    bsz = len(batch)
-
-    x = torch.zeros(bsz, max_t, f, c, dtype=torch.float32)
-    m = torch.zeros(bsz, max_t, f, dtype=torch.bool)
-    y = torch.zeros(bsz, max_t, dtype=torch.long)
-    layer_mask = torch.zeros(bsz, max_t, dtype=torch.bool)
-
-    labels, pen_layers, layer_lists, paths = [], [], [], []
-    for i, s in enumerate(batch):
-        fd = s["frame_data"]
-        t_actual = int(fd.shape[0])
-
-        # Align seq_label T to frame_data T (precomputed cache may have mismatch)
-        seq_lbl = s["seq_label"]
-        if seq_lbl.ndim == 1:
-            if seq_lbl.shape[0] < t_actual:
-                seq_lbl = F.pad(seq_lbl, (0, t_actual - seq_lbl.shape[0]))
-            elif seq_lbl.shape[0] > t_actual:
-                seq_lbl = seq_lbl[:t_actual]
-
-        x[i, :t_actual] = fd
-        m[i, :t_actual] = s["frame_mask"]
-        y[i, :t_actual] = seq_lbl
-        layer_mask[i, :t_actual] = True
-        labels.append(int(s["label"]))
-        pen_layers.append(int(s["penetration_layer"]))
-        layer_lists.append(s["layer_list"])
-        paths.append(s["sample_path"])
-
-    out = {
-        "frame_data": x,
-        "frame_mask": m,
-        "seq_label": y,
-        "layer_mask": layer_mask,
-        "label": torch.tensor(labels, dtype=torch.long),
-        "penetration_layer": torch.tensor(pen_layers, dtype=torch.long),
-        "layer_list": layer_lists,
-        "sample_path": paths,
-    }
-    try:
-        out["layer_extra"] = compute_layer_extra_features(x, m)
-    except Exception:
-        # 特征为辅助项；若某环境 torch.fft 不可用或其他异常，退化为不提供
-        pass
-    return out
-

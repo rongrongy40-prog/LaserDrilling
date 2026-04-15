@@ -16,6 +16,26 @@ except ImportError:  # pragma: no cover
     from PIL import Image
 
 
+# HSV 阈值（OpenCV: H∈[0,179], S/V∈[0,255]）
+# 这里的“激光/亮点”在不同相机/曝光下可能偏暗或低饱和，因此用多段阈值做并集以减少漏检。
+_LASER_BRIGHT_HSV_RANGES: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...] = (
+    # 只保留黄-红色系（避免把绿色高亮吃进来）
+    ((0, 70, 115), (35, 255, 255)),  # 黄/橙/红（低 H 段）
+    ((160, 60, 115), (180, 255, 255)),  # 红（高 H 段，Hue wrap-around）
+    # 偏暗但仍是黄-红色系：用于捕捉“暗橙色弧形火花/尾迹”
+    ((0, 50, 35), (45, 255, 255)),
+    ((160, 45, 35), (180, 255, 255)),
+    ((0, 0, 200), (180, 110, 255)),  # 低饱和但很亮（近白/过曝）兜底
+)
+
+# “主体”颜色（以亮点为中心的局部窗口内做粗分割）
+_BODY_HSV_RANGES: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...] = (
+    # 主体也限制在黄-红色系 + 红 wrap-around
+    ((0, 25, 10), (50, 255, 255)),
+    ((160, 20, 10), (180, 255, 255)),
+)
+
+
 def parse_frame_layer_from_filename(filename: str):
     """
     从图片文件名解析拍摄序号(帧)与层号。
@@ -209,9 +229,10 @@ def _laser_bright_mask_u8(rgb01: np.ndarray) -> np.ndarray | None:
     rgb_u8 = (np.clip(rgb01, 0.0, 1.0) * 255.0).astype(np.uint8)
     bgr_u8 = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
     hsv = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2HSV)
-    bright1 = cv2.inRange(hsv, (8, 110, 150), (45, 255, 255))
-    bright2 = cv2.inRange(hsv, (0, 0, 210), (180, 80, 255))
-    bright = cv2.bitwise_or(bright1, bright2)
+    bright = None
+    for lo, hi in _LASER_BRIGHT_HSV_RANGES:
+        m = cv2.inRange(hsv, lo, hi)
+        bright = m if bright is None else cv2.bitwise_or(bright, m)
     k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, k3)
@@ -394,9 +415,11 @@ def _color_cc_box(
     bgr_u8 = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
     hsv = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2HSV)
 
-    bright1 = cv2.inRange(hsv, (8, 110, 150), (45, 255, 255))
-    bright2 = cv2.inRange(hsv, (0, 0, 210), (180, 80, 255))
-    bright = cv2.bitwise_or(bright1, bright2)
+    # 与 _laser_bright_mask_u8 保持一致（多段并集阈值）
+    bright = None
+    for lo, hi in _LASER_BRIGHT_HSV_RANGES:
+        m = cv2.inRange(hsv, lo, hi)
+        bright = m if bright is None else cv2.bitwise_or(bright, m)
     k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, k3)
@@ -431,9 +454,10 @@ def _color_cc_box(
     if xa1 <= xa0 or ya1 <= ya0:
         return None
     local = hsv[ya0:ya1, xa0:xa1]
-    body1 = cv2.inRange(local, (0, 35, 20), (30, 255, 220))
-    body2 = cv2.inRange(local, (160, 25, 20), (180, 255, 220))
-    body = cv2.bitwise_or(body1, body2)
+    body = None
+    for lo, hi in _BODY_HSV_RANGES:
+        m = cv2.inRange(local, lo, hi)
+        body = m if body is None else cv2.bitwise_or(body, m)
     body = cv2.morphologyEx(body, cv2.MORPH_CLOSE, k5)
     body = cv2.dilate(body, k5, iterations=1)
     n2, _, st2, _ = cv2.connectedComponentsWithStats(body, connectivity=8)
