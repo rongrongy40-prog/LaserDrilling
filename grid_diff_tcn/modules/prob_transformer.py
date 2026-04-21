@@ -67,6 +67,11 @@ class ProbabilisticSelfAttention(nn.Module):
         vh = self._reshape_heads(v)
 
         attn_scores = torch.matmul(qh, kh.transpose(-2, -1)) * self.scale  # (B,H,T,T)
+
+        # Causal mask: position t can only attend to positions <= t
+        causal_mask = torch.tril(torch.ones(t, t, device=x.device, dtype=torch.bool))
+        attn_scores = attn_scores.masked_fill(~causal_mask, float("-inf"))
+
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
 
@@ -113,10 +118,22 @@ class ProbTransformerEncoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(float(dropout))
         self.activation = nn.GELU()
 
-    def forward(self, src: torch.Tensor, force_sample_kv: bool = False) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def forward(self, src: torch.Tensor, force_sample_kv: bool = False,
+                use_cache: bool = False, layer_idx: int = 0,
+                kv_cache: list | None = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
         src2, extra_attn = self.self_attn(self.norm1(src), need_weights=False, force_sample_kv=force_sample_kv)
         src = src + self.dropout1(src2)
         ff = self.linear2(self.dropout2(self.activation(self.linear1(self.norm2(src)))))
         src = src + ff
+
+        if use_cache and kv_cache is not None:
+            # kv_cache is [k_cache, v_cache] — append new step's key/value
+            k_new = self.self_attn.qkv_proj(self.norm1(src))[:, :, self.embed_dim*2:self.embed_dim*4]  # k_mu part
+            v_new = self.self_attn.qkv_proj(self.norm1(src))[:, :, self.embed_dim*4:]                # v_mu part
+            k_all = torch.cat([kv_cache[0], k_new], dim=1)
+            v_all = torch.cat([kv_cache[1], v_new], dim=1)
+            kv_cache.clear()
+            kv_cache.extend([k_all, v_all])
+
         return src, extra_attn
 

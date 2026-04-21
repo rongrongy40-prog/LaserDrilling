@@ -454,7 +454,6 @@ def main():
     ap.add_argument("--roi_size", type=int, default=96)
     ap.add_argument("--max_frames_per_layer", type=int, default=8)
     ap.add_argument("--max_layers", type=int, default=None)
-    ap.add_argument("--penetration_radius", type=int, default=2)
     ap.add_argument("--precomputed_dir", type=str, default=None, help="hierarchical precomputed .pt directory")
 
     ap.add_argument("--cc_min_area", type=int, default=12)
@@ -626,7 +625,6 @@ def main():
             target_size=(int(args.img_size), int(args.img_size)),
             max_layers=args.max_layers,
             max_frames_per_layer=int(args.max_frames_per_layer),
-            penetration_radius=int(args.penetration_radius),
             exclude_json=args.exclude_json,
             final_roi_scale=float(args.final_roi_scale),
             cc_min_area=int(args.cc_min_area),
@@ -651,7 +649,6 @@ def main():
             pool_stats=("mean", "std", "max"),
             max_layers=args.max_layers,
             max_frames_per_layer=int(args.max_frames_per_layer),
-            penetration_radius=int(args.penetration_radius),
             exclude_json=args.exclude_json,
             final_roi_scale=float(args.final_roi_scale),
             cc_min_area=int(args.cc_min_area),

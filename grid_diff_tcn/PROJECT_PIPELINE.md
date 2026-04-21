@@ -589,7 +589,6 @@ python -m grid_diff_tcn.hier.train \
 | `--roi_size`             | 96/224 | ROI裁剪尺寸   |
 | `--max_frames_per_layer` | 8      | 每层最大帧数    |
 | `--max_layers`           | None   | 最大层数      |
-| `--penetration_radius`   | 2      | 穿透标签扩展半径  |
 | `--cc_min_area`          | 12     | 连通域最小面积   |
 | `--cc_expand_ratio`      | 0.2    | 检测框扩展比例   |
 | `--final_roi_scale`      | 0.85   | ROI占检测框比例 |
@@ -683,55 +682,9 @@ python -m grid_diff_tcn.hier.train \
 - 768维CLS token比手工特征更语义丰富
 
 ---
-
-## 十四、常见问题
-
-### Q1: 显存不足怎么办？
-
-```bash
-# 使用更小的模型
---dinov3_model vit_small --dinov3_feat_dim 384
-
-# 减小batch_size
---batch_size 2
-
-# 使用CPU（非常慢）
---device cpu
-```
-
-### Q2: 预计算失败怎么办？
-
-```bash
-# 检查样本路径是否正确
-# 查看日志中的skip_no_roi列表
-# 调整ROI检测参数
-```
-
-### Q3: 如何切换手工特征和DINOv3？
-
-```bash
-# 手工特征：不加--use_dinov3
-python -m grid_diff_tcn.hier.train --precomputed_dir cache_hierarchical_features
-
-# DINOv3：添加--use_dinov3
-python -m grid_diff_tcn.hier.train --use_dinov3 --precomputed_dir cache_dinov3_features_vits
-```
-
-### Q4: 推理结果不好怎么办？
-
-```bash
-# 调整决策参数
---k 7 --min_thresh 0.25
-
-# 启用MC采样
---unc_samples 20 --unc_gate
-
-# 使用S3WD决策
---decision_method s3wd
-```
-
-### Q5: 如何调整S3WD阈值而不重新训练？
-
-网格搜索结果保存在 `{模型路径}_s3wd_grid.json`，包含所有参数组合的指标。
-直接编辑 `infer.sh` 中的 `--s3wd_accept --s3wd_reject --s3wd_wait` 参数即可。
-
+损失	权重	说明
+Focal CE	-	基础分类损失，α=0.75, γ=2.0
+Window CE	in_window=2.0	真值±3层范围内加权
+loc3_loss	0.3	软预测位置与真值距离 >3 的均方误差
+within3_loss	0.7	概率集中在真值±3层内的交叉熵
+KL Loss	0.01	概率分布正则化

@@ -6,9 +6,7 @@ set -euo pipefail
 #
 # DINOv3 训练模式（推荐）:
 #   bash grid_diff_tcn/hier/scripts/train.sh --use_dinov3 --dinov3_model vit_base
-#
-# 手工特征模式（对比基准）:
-#   bash grid_diff_tcn/hier/scripts/train.sh
+
 
 python3 -m grid_diff_tcn.hier.train \
   --samples_info data_drilling/samples_info_train.json \
@@ -23,7 +21,6 @@ python3 -m grid_diff_tcn.hier.train \
   --device cuda \
   --img_size 128 \
   --max_frames_per_layer 8 \
-  --penetration_radius 2 \
   --cc_min_area 12 \
   --cc_expand_ratio 0.2 \
   --final_roi_scale 0.85 \

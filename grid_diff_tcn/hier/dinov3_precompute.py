@@ -153,7 +153,6 @@ def _build_ds_kwargs(args: argparse.Namespace) -> dict:
         "roi_size": int(args.roi_size),
         "max_layers": args.max_layers,
         "max_frames_per_layer": int(args.max_frames_per_layer),
-        "penetration_radius": int(args.penetration_radius),
         "exclude_json": excl,
         "final_roi_scale": float(args.final_roi_scale),
         "cc_min_area": int(args.cc_min_area),
@@ -208,7 +207,6 @@ def main():
     ap.add_argument("--img_size", type=int, default=DEFAULT_TARGET_WH[0])
     ap.add_argument("--max_frames_per_layer", type=int, default=8)
     ap.add_argument("--max_layers", type=int, default=None)
-    ap.add_argument("--penetration_radius", type=int, default=2)
     ap.add_argument("--cc_min_area", type=int, default=DEFAULT_CC_MIN_AREA)
     ap.add_argument("--cc_expand_ratio", type=float, default=DEFAULT_CC_EXPAND_RATIO)
     ap.add_argument("--final_roi_scale", type=float, default=DEFAULT_FINAL_ROI_SCALE)
@@ -270,7 +268,6 @@ def main():
         target_size=(int(args.img_size), int(args.img_size)),
         max_layers=args.max_layers,
         max_frames_per_layer=int(args.max_frames_per_layer),
-        penetration_radius=int(args.penetration_radius),
         exclude_json=ds_kwargs.get("exclude_json"),
         final_roi_scale=float(args.final_roi_scale),
         cc_min_area=int(args.cc_min_area),

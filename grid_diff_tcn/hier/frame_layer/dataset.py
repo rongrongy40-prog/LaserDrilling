@@ -232,7 +232,6 @@ class HierarchicalFrameLayerDataset(Dataset):
         pool_stats: Tuple[str, ...] = ("mean", "std", "max"),
         max_layers: int | None = None,
         max_frames_per_layer: int = 8,
-        penetration_radius: int = 2,
         exclude_json: str | None = None,
         final_roi_scale: float = 0.85,
         cc_min_area: int = 12,
@@ -275,7 +274,6 @@ class HierarchicalFrameLayerDataset(Dataset):
         self._feat_dim = int(grid[0]) * int(grid[1]) * len(self.pool_stats)
         self.max_layers = max_layers
         self.max_frames_per_layer = int(max_frames_per_layer)
-        self.penetration_radius = int(max(0, penetration_radius))
         self.exclude_set = load_exclude_set(exclude_json) if exclude_json else set()
 
         self.final_roi_scale = float(final_roi_scale)
@@ -439,8 +437,7 @@ class HierarchicalFrameLayerDataset(Dataset):
         seq_label = np.zeros((t,), dtype=np.int64)
         if int(sample["is_penetrated"]) == 1 and int(sample["penetration_layer"]) in layer_list:
             pos = layer_list.index(int(sample["penetration_layer"]))
-            r = self.penetration_radius
-            seq_label[max(0, pos - r) : min(t, pos + r + 1)] = 1
+            seq_label[pos:] = 1
 
         return {
             "frame_data": torch.from_numpy(data).float(),

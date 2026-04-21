@@ -107,7 +107,6 @@ def _build_ds_kwargs(args: argparse.Namespace) -> dict:
         "pool_stats": ("mean", "std", "max"),
         "max_layers": args.max_layers,
         "max_frames_per_layer": int(args.max_frames_per_layer),
-        "penetration_radius": int(args.penetration_radius),
         "exclude_json": excl,
         "final_roi_scale": float(args.final_roi_scale),
         "cc_min_area": int(args.cc_min_area),
@@ -139,7 +138,6 @@ def main():
     ap.add_argument("--roi_size", type=int, default=DEFAULT_ROI_SIZE)
     ap.add_argument("--max_frames_per_layer", type=int, default=8)
     ap.add_argument("--max_layers", type=int, default=None)
-    ap.add_argument("--penetration_radius", type=int, default=2)
 
     ap.add_argument("--cc_min_area", type=int, default=DEFAULT_CC_MIN_AREA)
     ap.add_argument("--cc_expand_ratio", type=float, default=DEFAULT_CC_EXPAND_RATIO)

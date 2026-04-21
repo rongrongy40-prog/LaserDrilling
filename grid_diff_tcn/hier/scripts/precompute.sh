@@ -12,7 +12,6 @@ python3 -m grid_diff_tcn.hier.precompute \
   --img_size 128 \
   --roi_size 96 \
   --max_frames_per_layer 8 \
-  --penetration_radius 2 \
   --cc_min_area 12 \
   --cc_expand_ratio 0.2 \
   --final_roi_scale 0.85 \

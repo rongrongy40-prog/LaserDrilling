@@ -83,7 +83,7 @@ class HierarchicalDinoV3Dataset(Dataset):
         dinov3_feat_dim: dimension of DINOv3 features (default 768 for ViT-B)
         roi_size: size of ROI crop (default 224, recommended for DINOv3)
         target_size: resize target (default (224, 224))
-        max_layers, max_frames_per_layer, penetration_radius, etc.:
+        max_layers, max_frames_per_layer, etc.:
             see HierarchicalFrameLayerDataset
         precomputed_dir: if provided, load cached features from this directory
             instead of running DINOv3 at data loading time
@@ -99,7 +99,6 @@ class HierarchicalDinoV3Dataset(Dataset):
         target_size: Tuple[int, int] = (224, 224),
         max_layers: int | None = None,
         max_frames_per_layer: int = 8,
-        penetration_radius: int = 2,
         exclude_json: str | None = None,
         final_roi_scale: float = 0.85,
         cc_min_area: int = 12,
@@ -139,7 +138,6 @@ class HierarchicalDinoV3Dataset(Dataset):
         self.target_size = target_size
         self.max_layers = max_layers
         self.max_frames_per_layer = int(max_frames_per_layer)
-        self.penetration_radius = int(max(0, penetration_radius))
         self.exclude_set = load_exclude_set(exclude_json) if exclude_json else set()
 
         self.final_roi_scale = float(final_roi_scale)
@@ -349,8 +347,7 @@ class HierarchicalDinoV3Dataset(Dataset):
         seq_label = np.zeros((t,), dtype=np.int64)
         if int(sample["is_penetrated"]) == 1 and int(sample["penetration_layer"]) in layer_list:
             pos = layer_list.index(int(sample["penetration_layer"]))
-            r = self.penetration_radius
-            seq_label[max(0, pos - r) : min(t, pos + r + 1)] = 1
+            seq_label[pos:] = 1
 
         return {
             "frame_data": torch.from_numpy(data).float(),
