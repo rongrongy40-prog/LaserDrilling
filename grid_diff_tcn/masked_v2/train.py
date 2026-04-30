@@ -778,9 +778,9 @@ def evaluate_stage2(
         metrics["learned_decision"] = True
     else:
         # S3WD grid search over (threshold, accept, wait)
-        s3wd_thresholds = [0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]
-        s3wd_accept_vals = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
-        s3wd_wait_vals = [3, 4, 5, 6, 7, 8, 9, 10]
+        s3wd_thresholds = [ 0.6]
+        s3wd_accept_vals = [0.4]
+        s3wd_wait_vals = [3]
 
         best_s3wd_metric = -1
         best_s3wd_params = {}

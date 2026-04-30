@@ -36,7 +36,7 @@ MASK_RATIO="${MASK_RATIO:-0.75}"
 MASK_SHAPE="${MASK_SHAPE:-circle}"
 
 # ---- 训练 ----
-BATCH_SIZE="${BATCH_SIZE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 EPOCHS="${EPOCHS:-50}"
 LR="${LR:-1e-4}"                         # classifier lr (reduced from 1e-4)
 ENCODER_LR_STAGE2="${ENCODER_LR_STAGE2:-1e-5}"  # encoder lr（仅 unfreeze 时用）
@@ -50,7 +50,7 @@ ACCUM_STEPS_STAGE2="${ACCUM_STEPS_STAGE2:-4}"  # 梯度累积步数
 
 # ---- 调试 ----
 # 快速验证流程：设为正整数（如 3），限制训练样本数
-MAX_SAMPLES="${MAX_SAMPLES:-10}"
+MAX_SAMPLES="${MAX_SAMPLES:-}"
 
 # ---- 保存 ----
 SAVE_DIR="${SAVE_DIR:-grid_diff_tcn/masked_v2/checkpoints}"
@@ -60,11 +60,11 @@ SAVE="${SAVE:-${SAVE_DIR}/stage2.pt}"
 # ---- 其他 ----
 MAX_FRAMES_PER_LAYER="${MAX_FRAMES_PER_LAYER:-10}"
 WEIGHT_POS="${WEIGHT_POS:-3.0}"
-PEAK_LOSS_WEIGHT="${PEAK_LOSS_WEIGHT:-0.05}"
-SMOOTHNESS_WEIGHT="${SMOOTHNESS_WEIGHT:-0.1}"
+PEAK_LOSS_WEIGHT="${PEAK_LOSS_WEIGHT:-0.15}"
+SMOOTHNESS_WEIGHT="${SMOOTHNESS_WEIGHT:-0.05}"
 BOUNDARY_WEIGHT="${BOUNDARY_WEIGHT:-0.15}"
 LOCK_LAYERS="${LOCK_LAYERS:-30}"
-USE_LEARNED_DECISION="${USE_LEARNED_DECISION:-True}"
+USE_LEARNED_DECISION="${USE_LEARNED_DECISION:-False}"
 INDEX_LOSS_WEIGHT="${INDEX_LOSS_WEIGHT:-1.0}"
 
 if [[ -z "$RESUME_FROM" ]]; then
@@ -99,7 +99,7 @@ ARGS=(
   --smoothness_weight "$SMOOTHNESS_WEIGHT"
   --boundary_weight "$BOUNDARY_WEIGHT"
   --stage2_scheduler cosine
-  --use_learned_decision
+  # --use_learned_decision
   --max_frames_per_layer "$MAX_FRAMES_PER_LAYER"
   --lock_layers "$LOCK_LAYERS"
   --seed 42
