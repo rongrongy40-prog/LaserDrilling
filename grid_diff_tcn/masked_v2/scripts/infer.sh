@@ -88,8 +88,8 @@ PRELOAD="${PRELOAD:-1}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
 
 # ---- S3WD / 决策参数 ----
-S3WD_WAIT="${S3WD_WAIT:-4}"
-S3WD_THRESH="${S3WD_THRESH:-0.65}"
+S3WD_WAIT="${S3WD_WAIT:-3}"
+S3WD_THRESH="${S3WD_THRESH:-0.6}"
 S3WD_ACCEPT="${S3WD_ACCEPT:-0.4}"
 
 # ---- 流式推理（early stopping）----

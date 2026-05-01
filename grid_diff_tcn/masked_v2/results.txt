@@ -1,0 +1,4 @@
+[Phase 2 Test] Decision=s3wd  n=299
+  pct_within_3: 69.2%
+  pct_within_5: 81.3%
+  pct_over_10:  8.0%

@@ -456,7 +456,7 @@ def run_inference(
 
             result = model.forward(
                 frame_data, frame_mask=frame_mask,
-                return_decision_idx=use_learned_decision,
+                return_decision_idx=(decision_method == "learned"),
             )
             logits = result["logits"]
 
@@ -470,7 +470,7 @@ def run_inference(
 
             # Collect learned decision indices if available
             decision_idx_batch = None
-            if use_learned_decision:
+            if decision_method == "learned":
                 decision_idx_batch = result.get("decision_idx")
                 if decision_idx_batch is not None:
                     decision_idx_batch = decision_idx_batch.cpu()
@@ -637,7 +637,7 @@ def run_streaming_inference(
     dataset: Dataset,
     device: torch.device,
     lock_layers: int = 30,
-    decision_method: str = "learned",
+    decision_method: str = "threshold",
     stop_thresh: float = 0.5,
     stop_wait: int = 3,
     max_inference_layers: int | None = None,
@@ -1080,7 +1080,6 @@ def main():
                 s3wd_accept=best_s3wd_params["accept"],
                 lock_layers=args.lock_layers,
                 best_s3wd_params=None,
-                use_learned_decision=args.decision_method == "learned",
             )
         else:
             best_s3wd_params, all_grid_results = grid_search_s3wd(
@@ -1102,7 +1101,6 @@ def main():
                 decision_method="s3wd",
                 lock_layers=args.lock_layers,
                 best_s3wd_params=best_s3wd_params,
-                use_learned_decision=args.decision_method == "learned",
             )
 
         val_metrics["decision_method"] = args.decision_method
@@ -1118,22 +1116,22 @@ def main():
         print(f"[Phase 1] Val CSV saved to {val_csv_path}")
     else:
         # No validation — use default or CLI params; try checkpoint s3wd_params first
-            if args.decision_method == "s3wd":
-                ckpt_s3wd = checkpoint.get("s3wd_params")
-                if ckpt_s3wd:
-                    best_s3wd_params = ckpt_s3wd
-                    print(f"[Main] Loaded s3wd params from checkpoint: "
-                          f"wait={best_s3wd_params['wait']}, thresh={best_s3wd_params['threshold']}, "
-                          f"accept={best_s3wd_params.get('accept','?')}")
-                else:
-                    best_s3wd_params = {
-                        "wait": args.s3wd_wait,
-                        "threshold": args.s3wd_thresh,
-                        "accept": args.s3wd_accept,
-                    }
-                    print(f"[Main] No checkpoint s3wd params — using CLI: "
-                          f"wait={best_s3wd_params['wait']}, thresh={best_s3wd_params['threshold']}, "
-                          f"accept={best_s3wd_params['accept']}")
+        if args.decision_method == "s3wd":
+            ckpt_s3wd = checkpoint.get("s3wd_params")
+            if ckpt_s3wd:
+                best_s3wd_params = ckpt_s3wd
+                print(f"[Main] Loaded s3wd params from checkpoint: "
+                      f"wait={best_s3wd_params['wait']}, thresh={best_s3wd_params['threshold']}, "
+                      f"accept={best_s3wd_params.get('accept','?')}")
+            else:
+                best_s3wd_params = {
+                    "wait": args.s3wd_wait,
+                    "threshold": args.s3wd_thresh,
+                    "accept": args.s3wd_accept,
+                }
+                print(f"[Main] No checkpoint s3wd params — using CLI: "
+                      f"wait={best_s3wd_params['wait']}, thresh={best_s3wd_params['threshold']}, "
+                      f"accept={best_s3wd_params['accept']}")
 
     # -------------------------------------------------------------------------
     # Phase 2: Test set inference
@@ -1169,7 +1167,7 @@ def main():
         test_rows, test_metrics, _ = run_streaming_inference(
             model, test_dataset, device,
             lock_layers=args.lock_layers,
-            decision_method=eff_method if eff_method in ("learned", "threshold") else "learned",
+            decision_method="threshold",
             stop_thresh=args.stop_thresh,
             stop_wait=args.stop_wait,
             max_inference_layers=args.max_inference_layers,
@@ -1181,14 +1179,14 @@ def main():
         test_rows, test_metrics = run_inference(
             model, test_loader, test_dataset, device,
             decision_method=eff_method,
-            s3wd_wait=args.s3wd_wait,
-            s3wd_thresh=args.s3wd_thresh,
-            s3wd_accept=args.s3wd_accept,
+            s3wd_wait=eff_s3wd_params["wait"] if eff_s3wd_params else args.s3wd_wait,
+            s3wd_thresh=eff_s3wd_params["threshold"] if eff_s3wd_params else args.s3wd_thresh,
+            s3wd_accept=eff_s3wd_params["accept"] if eff_s3wd_params else args.s3wd_accept,
             lock_layers=args.lock_layers,
             best_s3wd_params=eff_s3wd_params,
-            use_learned_decision=args.decision_method == "learned",
+            # use_learned_decision=args.decision_method == "learned",
         )
-        csv_fieldnames = ["hole_path", "true_layer", "pred_layer", "error", "raw_decision_idx"]
+        csv_fieldnames = ["hole_path", "true_layer", "pred_layer", "error"]
     test_metrics["decision_method"] = eff_method + ("_streaming" if args.streaming else "")
 
     print_metrics(test_metrics, prefix="[Phase 2 Test]")
