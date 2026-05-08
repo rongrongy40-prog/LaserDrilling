@@ -1,12 +1,9 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
 # ============================================================
-# Stage 1: MIM 预训练 (masked_v2)
-#   encoder + decoder 联合训练，classifier 冻结
+# Stage 1: Standard MAE 预训练 (masked_v2)
+#   encoder 冻结（使用原始预训练权重），仅训练 MAE decoder
+#   相比旧版 CenterMask + CLS-only decoder，这是真正的标准 MAE
 # ============================================================
 
-# 获取脚本所在目录（向上4级得到 repo 根目录）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
@@ -14,7 +11,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_train_split.json}"
 VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val.json}"
 
-# 加速: 预裁剪 ROI 缓存（必须，已由 pre_crop.py 生成）
+# 加速: 预裁剪 ROI 缓存
 CROP_CACHE_DIR="${CROP_CACHE_DIR:-data_drilling/roi_cache}"
 
 # ---- DINOv3 ----
@@ -27,24 +24,21 @@ DINOV3_CHUNK_SIZE="${DINOV3_CHUNK_SIZE:-32}"
 D_MODEL="${D_MODEL:-128}"
 NHEAD="${NHEAD:-4}"
 NUM_LAYERS="${NUM_LAYERS:-2}"
-# v2: encoder 默认可训练
-FREEZE_ENCODER="${FREEZE_ENCODER:-False}"
+# encoder 始终冻结，仅训练 MAE decoder
+FREEZE_ENCODER="${FREEZE_ENCODER:-True}"
 MASK_RATIO="${MASK_RATIO:-0.75}"
-MASK_SHAPE="${MASK_SHAPE:-circle}"
 
 # ---- 训练 ----
-BATCH_SIZE="${BATCH_SIZE:-1}"   # 必须用 1，避免 collate padding 导致的 reshape 问题
-EPOCHS="${EPOCHS:-30}"
-LR="${LR:-1e-4}"                # decoder lr
-ENCODER_LR="${ENCODER_LR:-1e-6}"  # encoder lr（低 100 倍，防止遗忘）
-PATIENCE="${PATIENCE:-10}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+BATCH_SIZE="${BATCH_SIZE:-2}"   # 每个样本独立处理，无需 batching
+EPOCHS="${EPOCHS:-100}"
+LR="${LR:-1e-4}"                # MAE decoder lr
+PATIENCE="${PATIENCE:-8}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 ACCUM_STEPS="${ACCUM_STEPS:-4}"
-PRELOAD="${PRELOAD:-1}"
+PRELOAD="${PRELOAD:-0}"
 RESUME_FROM="${RESUME_FROM:-}"
 
 # ---- 调试 ----
-# 快速验证流程：设为正整数（如 3），限制训练样本数
 MAX_SAMPLES="${MAX_SAMPLES:-}"
 
 # ---- 保存 ----
@@ -53,8 +47,14 @@ mkdir -p "$SAVE_DIR"
 SAVE="${SAVE:-${SAVE_DIR}/stage1.pt}"
 
 # ---- 其他 ----
-MAX_FRAMES_PER_LAYER="${MAX_FRAMES_PER_LAYER:-10}"
+MAX_FRAMES_PER_LAYER="${MAX_FRAMES_PER_LAYER:-15}"
 LOCK_LAYERS="${LOCK_LAYERS:-30}"
+STAGE1_SCHEDULER="${STAGE1_SCHEDULER:-cosine}"
+
+# ---- MAE decoder 超参数 ----
+MAE_DECODER_DIM="${MAE_DECODER_DIM:-256}"
+MAE_DECODER_DEPTH="${MAE_DECODER_DEPTH:-4}"
+MAE_DECODER_HEADS="${MAE_DECODER_HEADS:-8}"
 
 ARGS=(
   --samples_info "$SAMPLES_INFO"
@@ -68,17 +68,16 @@ ARGS=(
   --num_layers "$NUM_LAYERS"
   --freeze_encoder "$FREEZE_ENCODER"
   --mask_ratio "$MASK_RATIO"
-  --mask_shape "$MASK_SHAPE"
   --dinov3_chunk_size "$DINOV3_CHUNK_SIZE"
   --accum_steps "$ACCUM_STEPS"
   --batch_size "$BATCH_SIZE"
   --epochs "$EPOCHS"
   --lr "$LR"
-  --encoder_lr "$ENCODER_LR"
   --patience "$PATIENCE"
   --num_workers "$NUM_WORKERS"
   --max_frames_per_layer "$MAX_FRAMES_PER_LAYER"
   --lock_layers "$LOCK_LAYERS"
+  --stage1_scheduler "$STAGE1_SCHEDULER"
   --seed 42
   --save "$SAVE"
 )
@@ -100,14 +99,18 @@ if [[ -n "$MAX_SAMPLES" ]]; then
 fi
 
 echo "=============================================="
-echo "Stage 1: MIM Pre-training (encoder + decoder)"
+echo "Stage 1: Standard MAE Pre-training"
 echo "freeze_encoder  : $FREEZE_ENCODER"
-echo "encoder_lr      : $ENCODER_LR"
-echo "decoder_lr      : $LR"
-echo "batch_size      : $BATCH_SIZE"
-echo "max_samples     : ${MAX_SAMPLES:-(all)}"
-echo "crop_cache_dir  : $CROP_CACHE_DIR"
-echo "save            : $SAVE"
+echo "mask_ratio     : $MASK_RATIO"
+echo "decoder_lr     : $LR"
+echo "decoder_dim    : $MAE_DECODER_DIM"
+echo "decoder_depth  : $MAE_DECODER_DEPTH"
+echo "decoder_heads  : $MAE_DECODER_HEADS"
+echo "batch_size     : $BATCH_SIZE"
+echo "max_samples    : ${MAX_SAMPLES:-(all)}"
+echo "crop_cache_dir : $CROP_CACHE_DIR"
+echo "scheduler     : $STAGE1_SCHEDULER"
+echo "save          : $SAVE"
 echo "=============================================="
 cd "$REPO_ROOT"
 python3 -m grid_diff_tcn.masked_v2.train "${ARGS[@]}"

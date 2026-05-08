@@ -220,41 +220,62 @@ def s3wd_decision(
     pen_layer: int,
     layers: List[int],
     wait: int,
-    thresh: float,
-    accept: float = 0.5,
+    threshold: float,
+    accept: float = 1.0,
     lock_layers: int = 30,
 ) -> int:
     """
-    S3WD: require `wait` consecutive valid timesteps above `thresh`.
-    Returns the predicted layer index (0-based in layers), or -1 if not penetrated.
-    The `accept` param controls the minimum probability to accept a decision
-    (if the max valid probability is below accept, return -1).
+    S3WD decision — mirrors train.py s3wd_decision exactly.
+
+    逻辑：
+    1. 从前往后扫，找第一个连续 `wait` 帧 prob >= threshold 的位置 ti
+       - 如果某帧 prob >= accept，跳过 wait 延迟，立即决策
+    2. 将 ti 映射回物理层 ID: pred_layer = layers[ti]
+    3. 如果找不到，fallback 到 argmax（返回 layers[argmax]）
+
+    Args:
+        prob_t: (T,) class-1 probability
+        mask_t: (T,) bool frame valid mask
+        pen_layer: physical layer ID (only used for lock_layers check here)
+        layers: physical layer IDs, len == T
+        wait: number of consecutive frames above threshold to confirm
+        threshold: probability threshold
+        accept: if prob >= accept, decision is made immediately (skip wait). Default 1.0 (disabled).
+        lock_layers: layers before this index are forced to non-penetrated
+
+    Returns:
+        pred_layer: physical layer ID, or -1 if not penetrated / invalid
     """
     if pen_layer < 0 or pen_layer not in layers:
         return -1
     pen_idx = layers.index(pen_layer)
     if pen_idx < lock_layers:
         return -1
+
+    t = len(prob_t)
     consecutive_high = 0
-    best_valid_prob = 0.0
-    best_layer = -1
-    for ti in range(len(prob_t)):
+
+    for ti in range(t):
         if not mask_t[ti]:
             continue
         p = float(prob_t[ti])
-        if p > best_valid_prob:
-            best_valid_prob = p
-            best_layer = ti
-        if p >= thresh:
+        if p >= accept:
+            return layers[ti] if ti < len(layers) else layers[-1]
+        if p >= threshold:
             consecutive_high += 1
             if consecutive_high >= wait:
-                if best_valid_prob >= accept:
-                    return best_layer
-                else:
-                    return -1
+                return layers[ti] if ti < len(layers) else layers[-1]
         else:
             consecutive_high = 0
-    return -1
+
+    # Fallback: argmax over valid positions → ti → layers[ti]
+    valid = mask_t
+    if valid.sum() == 0:
+        return -1
+    valid_prob = prob_t.clone()
+    valid_prob[~valid] = float("-inf")
+    argmax_ti = valid_prob.argmax().item()
+    return layers[argmax_ti] if argmax_ti < len(layers) else layers[-1]
 
 
 def compute_metrics(
@@ -381,7 +402,7 @@ def grid_search_s3wd(
                         continue
                     pred_layer = s3wd_decision(
                         prob_t, mask_t, pen_layer, layers,
-                        wait=wait, thresh=thresh, accept=accept, lock_layers=lock_layers,
+                        wait=wait, threshold=thresh, accept=accept, lock_layers=lock_layers,
                     )
                     preds.append(pred_layer)
 
@@ -418,8 +439,8 @@ def run_inference(
     device: torch.device,
     decision_method: str = "s3wd",
     s3wd_wait: int = 5,
-    s3wd_thresh: float = 0.6,
-    s3wd_accept: float = 0.3,
+    s3wd_threshold: float = 0.6,
+    s3wd_accept: float = 1.0,
     lock_layers: int = 30,
     best_s3wd_params: Optional[dict] = None,
 ) -> tuple[List[dict], dict]:
@@ -429,8 +450,9 @@ def run_inference(
     If decision_method == "s3wd" and best_s3wd_params is provided,
     those params override s3wd_wait / s3wd_thresh / s3wd_accept.
 
-    If decision_method == "learned", the LearnedDecisionHead is used directly
-    and decision_idx (rounded) becomes the prediction — no threshold tuning needed.
+    If decision_method == "learned", the TemporalDecisionHead is used directly
+    — first prob > 0.5 determines the prediction, same logic as training.
+    No threshold tuning needed.
 
     Returns:
         csv_rows: list of dicts with hole_path, true_layer, pred_layer, error
@@ -443,7 +465,7 @@ def run_inference(
     all_layer_lists: List[List[int]] = []
     all_sample_paths: List[str] = []
     all_frame_probs: List[tuple] = []
-    all_decision_idx_raw: List[float] = []  # raw float predictions from learned head
+    all_decision_probs: List[torch.Tensor] = []  # (T,) per sample, for learned decision
 
     with torch.inference_mode():
         for batch in tqdm(loader, desc="[Inference] Running model"):
@@ -468,12 +490,12 @@ def run_inference(
 
             probs = F.softmax(logits_locked, dim=1)[:, 1]  # (B, T)
 
-            # Collect learned decision indices if available
-            decision_idx_batch = None
+            # Collect learned decision probs if available
+            decision_probs_batch = None
             if decision_method == "learned":
-                decision_idx_batch = result.get("decision_idx")
-                if decision_idx_batch is not None:
-                    decision_idx_batch = decision_idx_batch.cpu()
+                decision_probs_batch = result.get("decision_probs")
+                if decision_probs_batch is not None:
+                    decision_probs_batch = decision_probs_batch.cpu()
 
             for bi in range(logits.shape[0]):
                 prob_t = probs[bi].cpu()
@@ -484,37 +506,43 @@ def run_inference(
                 all_pen_layers.append(int(pen_layers[bi].item()))
                 all_layer_lists.append(layer_lists_batch[bi])
                 all_sample_paths.append(sample_paths_batch[bi])
-                if decision_idx_batch is not None:
-                    all_decision_idx_raw.append(float(decision_idx_batch[bi].item()))
+                if decision_probs_batch is not None:
+                    all_decision_probs.append(decision_probs_batch[bi])
                 else:
-                    all_decision_idx_raw.append(0.0)
+                    all_decision_probs.append(prob_t)  # fallback: use raw probs
 
     # Decide effective params
     if decision_method == "s3wd" and best_s3wd_params:
         eff_wait = best_s3wd_params.get("wait", s3wd_wait)
-        eff_thresh = best_s3wd_params.get("threshold", s3wd_thresh)
+        eff_thresh = best_s3wd_params.get("threshold", s3wd_threshold)
         eff_accept = best_s3wd_params.get("accept", s3wd_accept)
     else:
         eff_wait = s3wd_wait
-        eff_thresh = s3wd_thresh
+        eff_thresh = s3wd_threshold
         eff_accept = s3wd_accept
 
     preds = []
-    for si, ((prob_t, mask_t), label, pen_layer, layers, raw_idx) in enumerate(zip(
-            all_frame_probs, all_labels, all_pen_layers, all_layer_lists, all_decision_idx_raw)):
+    for si, ((prob_t, mask_t), label, pen_layer, layers, dec_probs_t) in enumerate(zip(
+            all_frame_probs, all_labels, all_pen_layers, all_layer_lists, all_decision_probs)):
         if decision_method == "learned":
-            # LearnedDecisionHead: 直接用 round(raw_idx) 作为预测
+            # TemporalDecisionHead: 找第一个 prob > 0.5 的位置
             # lock_layers 安全锁：如果真实穿透层在 lock_layers 之前，预测 -1
             if label == 1 and pen_layer in layers:
                 pen_idx = layers.index(pen_layer)
                 if pen_idx >= lock_layers:
-                    pred_layer_idx = round(raw_idx)
-                    if 0 <= pred_layer_idx < len(layers):
-                        pred_layer = layers[pred_layer_idx]
+                    first_above = -1
+                    for ti in range(len(dec_probs_t)):
+                        if mask_t[ti] and dec_probs_t[ti] > 0.5:
+                            first_above = ti
+                            break
+                    if first_above >= 0:
+                        pred_layer = layers[first_above]
                     else:
-                        # 越界：clamp 到有效范围
-                        clamped = max(0, min(pred_layer_idx, len(layers) - 1))
-                        pred_layer = layers[clamped]
+                        # Fallback: argmax
+                        valid_probs = dec_probs_t.clone()
+                        valid_probs[~mask_t] = float("-inf")
+                        fallback_ti = valid_probs.argmax().item()
+                        pred_layer = layers[fallback_ti] if fallback_ti < len(layers) else layers[-1]
                 else:
                     pred_layer = -1
             else:
@@ -550,14 +578,23 @@ def run_inference(
 
     # Build CSV rows
     csv_rows = []
-    for sp, true_layer, pred_layer, layers, raw_idx in zip(
-            all_sample_paths, all_pen_layers, preds, all_layer_lists, all_decision_idx_raw):
+    for sp, true_layer, pred_layer, layers, dec_probs_t in zip(
+            all_sample_paths, all_pen_layers, preds, all_layer_lists, all_decision_probs):
         if true_layer >= 0 and pred_layer >= 0 and pred_layer in layers:
             true_idx = layers.index(true_layer)
             pred_idx = layers.index(pred_layer)
             error = abs(pred_idx - true_idx)
         else:
             error = -1
+        # Compute raw decision idx for logging: first prob > 0.5
+        raw_idx = -1.0
+        if isinstance(dec_probs_t, torch.Tensor):
+            for ti in range(len(dec_probs_t)):
+                if dec_probs_t[ti] > 0.5:
+                    raw_idx = float(ti)
+                    break
+            if raw_idx < 0:
+                raw_idx = float(dec_probs_t.argmax().item())
         csv_rows.append({
             "hole_path": sp,
             "true_layer": true_layer,
@@ -729,14 +766,21 @@ def run_streaming_inference(
             for ti in range(max_steps):
                 # Extract feature for this layer
                 if features is not None:
-                    # features: (1, T, F, C)
+                    # features: (1, T, F, C) — cached features
                     feat_t = features[:, ti:ti+1, :, :]          # (1, 1, F, C)
-                    mask_t = frame_mask[ti:ti+1].unsqueeze(0)     # (1, 1, F)
+                    mask_t = frame_mask[ti:ti+1].unsqueeze(0)    # (1, 1, F)
                 else:
-                    # frame_data: (T, F, 3, H, W)
+                    # frame_data: (T, F, 3, H, W) raw images
                     img_t = frame_data[ti:ti+1].unsqueeze(0)     # (1, 1, F, 3, H, W)
                     mask_t = frame_mask[ti:ti+1].unsqueeze(0)    # (1, 1, F)
-                    feat_t = img_t                                 # (1, 1, F, 3, H, W)
+                    # Extract DINOv3 features for this single layer's frames
+                    img_flat = img_t.reshape(-1, *img_t.shape[-3:])  # (1*1*F, 3, H, W)
+                    feat_list = []
+                    for start in range(0, img_flat.shape[0], model.dinov3_chunk_size):
+                        end = min(start + model.dinov3_chunk_size, img_flat.shape[0])
+                        feat_list.append(model.dinov3_extractor(img_flat[start:end].to(device)))
+                    feat_t = torch.cat(feat_list, dim=0)        # (1*1*F, C)
+                    feat_t = feat_t.reshape(*img_t.shape[:3], -1)  # (1, 1, F, C)
 
                 feat_t_dev = feat_t.to(device)
                 mask_t_dev = mask_t.to(device)
@@ -785,11 +829,14 @@ def run_streaming_inference(
                         ], dim=1).unsqueeze(0)  # (1, 2, T)
                         full_z = torch.zeros(1, len(all_probs_this_sample), 128)
                         try:
-                            decision_idx_full = float(
-                                model.classifier.decision_head(
-                                    full_z, full_logits, None
-                                ).cpu().item()
+                            dec_out = model.classifier.decision_head(
+                                full_z, full_logits, None
                             )
+                            # new TemporalDecisionHead returns dict; old returns float
+                            if isinstance(dec_out, dict):
+                                decision_idx_full = float(dec_out["pred_idx"][0].cpu().item())
+                            else:
+                                decision_idx_full = float(dec_out)
                         except Exception:
                             decision_idx_full = raw_idx_this_sample[-1] if raw_idx_this_sample else 0.0
                         pred_layer_idx = round(decision_idx_full)
@@ -831,8 +878,12 @@ def run_streaming_inference(
                 if raw_idx >= 0:
                     pred_layer_idx_clamped = max(0, min(int(round(raw_idx)), len(layers) - 1))
                     pred_layer = layers[pred_layer_idx_clamped]
-                    true_idx = layers.index(pen_l)
-                    error = abs(pred_layer_idx_clamped - true_idx)
+                    if pred_layer in layers:
+                        true_idx = layers.index(pen_l)
+                        error = abs(pred_layer_idx_clamped - true_idx)
+                    else:
+                        pred_layer = -1
+                        error = -1
                 else:
                     pred_layer = -1
                     error = -1
@@ -963,6 +1014,10 @@ def main():
     parser.add_argument("--freeze_encoder",
                         type=lambda x: x.lower() == "true", default=True)
     parser.add_argument("--mask_ratio", type=float, default=0.75)
+    parser.add_argument("--mae_decoder_dim", type=int, default=None,
+                        help="MAE decoder hidden dim. Inferred from checkpoint if not provided.")
+    parser.add_argument("--mae_decoder_heads", type=int, default=None,
+                        help="MAE decoder attention heads. Inferred from checkpoint if not provided.")
     parser.add_argument("--mask_shape", type=str, default="circle")
     parser.add_argument("--precomputed_dir", type=str, default=None)
     parser.add_argument("--use_cached_features", action="store_true")
@@ -994,24 +1049,30 @@ def main():
                         choices=["s3wd", "topkmedian", "threshold", "learned"])
     parser.add_argument("--lock_layers", type=int, default=30,
                         help="Layers before this index are forced to non-penetrated. Default 30.")
-    parser.add_argument("--s3wd_wait", type=int, default=5)
-    parser.add_argument("--s3wd_thresh", type=float, default=0.6,
+    parser.add_argument("--s3wd_wait", type=int, default=3,
+                        help="S3WD: number of consecutive frames above threshold to confirm. Default 3.")
+    parser.add_argument("--s3wd_thresh", type=str, default="0.6",
+                        help="DEPRECATED alias for --s3wd_threshold.")
+    parser.add_argument("--s3wd_threshold", type=float, default=0.6,
                         help="S3WD probability threshold (used when --run_val is NOT set)")
-    parser.add_argument("--s3wd_accept", type=float, default=0.3,
-                        help="S3WD accept threshold — min probability to confirm a decision "
-                             "(used when --run_val is NOT set)")
+    parser.add_argument("--s3wd_accept", type=float, default=1.0,
+                        help="S3WD accept threshold — if prob >= accept, decision is made immediately "
+                             "(skip wait). Default 1.0 (disabled). "
+                             "Set to e.g. 0.95 to immediately decide on high-confidence frames.")
     parser.add_argument("--skip_grid_search", action="store_true",
                         help="Skip S3WD grid search on validation set (use default s3wd_wait/s3wd_thresh/s3wd_accept)")
 
     # --- Streaming inference (early stopping) ---
-    parser.add_argument("--streaming", action="store_true",
-                        help="Enable streaming inference: process layers one-by-one with early stopping. "
-                             "As soon as penetration is detected, stop reading further layers.")
-    parser.add_argument("--stop_thresh", type=float, default=0.5,
+    parser.add_argument("--streaming", action="store_true", default=True,
+                        help="Enable streaming inference (default). Process layers one-by-one "
+                             "with early stopping — as soon as penetration is detected, stop.")
+    parser.add_argument("--no_streaming", action="store_false", dest="streaming",
+                        help="Disable streaming inference and use batch mode instead.")
+    parser.add_argument("--stop_thresh", type=float, default=0.6,
                         help="Penetration probability threshold for streaming early stop. Default 0.5.")
     parser.add_argument("--stop_wait", type=int, default=3,
                         help="Consecutive steps above stop_thresh to confirm early stop. Default 3.")
-    parser.add_argument("--stop_accept", type=float, default=0.3,
+    parser.add_argument("--stop_accept", type=float, default=0.7,
                         help="Minimum best probability to confirm early stop. Default 0.3.")
     parser.add_argument("--max_inference_layers", type=int, default=None,
                         help="Cap on layers processed per well in streaming mode (for non-penetrated). Default: all layers.")
@@ -1026,10 +1087,41 @@ def main():
 
     args = parser.parse_args()
 
+    # Backward compatibility: --s3wd_thresh (old str param) → --s3wd_threshold
+    if hasattr(args, "s3wd_thresh") and args.s3wd_thresh not in (None, "0.6"):
+        try:
+            args.s3wd_threshold = float(args.s3wd_thresh)
+            print(f"[Main] s3wd_thresh='{args.s3wd_thresh}' converted to s3wd_threshold={args.s3wd_threshold}")
+        except ValueError:
+            pass
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Main] Device: {device}")
 
     # --- Load model ---
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+
+    # Infer MAE decoder config from checkpoint if not provided via CLI.
+    ckpt_config = checkpoint.get("config", {})
+    mae_decoder_dim = args.mae_decoder_dim
+    mae_decoder_heads = args.mae_decoder_heads
+    mae_decoder_depth = ckpt_config.get("mae_decoder_depth", 4)
+    if mae_decoder_dim is None:
+        mae_decoder_dim = ckpt_config.get("mae_decoder_dim", 256)
+        if mae_decoder_dim is None:
+            mae_decoder_dim = 256
+    if mae_decoder_heads is None:
+        mae_decoder_heads = ckpt_config.get("mae_decoder_heads", 8)
+        if mae_decoder_heads is None:
+            mae_decoder_heads = 8
+    # Validate that decoder_dim is divisible by decoder_heads.
+    if mae_decoder_dim % mae_decoder_heads != 0:
+        raise ValueError(
+            f"mae_decoder_dim ({mae_decoder_dim}) must be divisible by "
+            f"mae_decoder_heads ({mae_decoder_heads}). "
+            f"Fix your --mae_decoder_dim / --mae_decoder_heads arguments or checkpoint config."
+        )
+
     model_kwargs = dict(
         dinov3_model=args.dinov3_model,
         dinov3_feat_dim=args.dinov3_feat_dim,
@@ -1039,12 +1131,14 @@ def main():
         num_transformer_layers=args.num_layers,
         freeze_encoder=args.freeze_encoder,
         mask_ratio=args.mask_ratio,
+        mae_decoder_dim=mae_decoder_dim,
+        mae_decoder_depth=mae_decoder_depth,
+        mae_decoder_heads=mae_decoder_heads,
         stage=2,
     )
     if args.use_cached_features and args.precomputed_dir:
         model_kwargs["use_cached_features"] = True
 
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
     model = MaskedPixelModel(**model_kwargs).to(device)
 
     if "state_dict" in checkpoint:
@@ -1067,7 +1161,7 @@ def main():
         val_dataset, val_loader = build_dataset(args, args.val_samples_info, mode=data_mode, device=device)
 
         if args.skip_grid_search:
-            best_s3wd_params = {"wait": args.s3wd_wait, "threshold": args.s3wd_thresh, "accept": args.s3wd_accept}
+            best_s3wd_params = {"wait": args.s3wd_wait, "threshold": args.s3wd_threshold, "accept": args.s3wd_accept}
             print(f"[Phase 1] skip_grid_search=True — using provided params: "
                   f"wait={best_s3wd_params['wait']}, thresh={best_s3wd_params['threshold']}, "
                   f"accept={best_s3wd_params['accept']}")
@@ -1076,7 +1170,7 @@ def main():
                 model, val_loader, val_dataset, device,
                 decision_method=args.decision_method,
                 s3wd_wait=best_s3wd_params["wait"],
-                s3wd_thresh=best_s3wd_params["threshold"],
+                s3wd_threshold=best_s3wd_params["threshold"],
                 s3wd_accept=best_s3wd_params["accept"],
                 lock_layers=args.lock_layers,
                 best_s3wd_params=None,
@@ -1126,7 +1220,7 @@ def main():
             else:
                 best_s3wd_params = {
                     "wait": args.s3wd_wait,
-                    "threshold": args.s3wd_thresh,
+                    "threshold": args.s3wd_threshold,
                     "accept": args.s3wd_accept,
                 }
                 print(f"[Main] No checkpoint s3wd params — using CLI: "
@@ -1167,7 +1261,7 @@ def main():
         test_rows, test_metrics, _ = run_streaming_inference(
             model, test_dataset, device,
             lock_layers=args.lock_layers,
-            decision_method="threshold",
+            decision_method=eff_method,
             stop_thresh=args.stop_thresh,
             stop_wait=args.stop_wait,
             max_inference_layers=args.max_inference_layers,
@@ -1180,13 +1274,13 @@ def main():
             model, test_loader, test_dataset, device,
             decision_method=eff_method,
             s3wd_wait=eff_s3wd_params["wait"] if eff_s3wd_params else args.s3wd_wait,
-            s3wd_thresh=eff_s3wd_params["threshold"] if eff_s3wd_params else args.s3wd_thresh,
+            s3wd_threshold=eff_s3wd_params["threshold"] if eff_s3wd_params else args.s3wd_threshold,
             s3wd_accept=eff_s3wd_params["accept"] if eff_s3wd_params else args.s3wd_accept,
             lock_layers=args.lock_layers,
             best_s3wd_params=eff_s3wd_params,
             # use_learned_decision=args.decision_method == "learned",
         )
-        csv_fieldnames = ["hole_path", "true_layer", "pred_layer", "error"]
+        csv_fieldnames = ["hole_path", "true_layer", "pred_layer", "error", "raw_decision_idx"]
     test_metrics["decision_method"] = eff_method + ("_streaming" if args.streaming else "")
 
     print_metrics(test_metrics, prefix="[Phase 2 Test]")

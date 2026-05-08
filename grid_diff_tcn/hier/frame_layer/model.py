@@ -44,130 +44,163 @@ class SoftArgmax1D(nn.Module):
         return pred
 
 
-class LearnedDecisionHead(nn.Module):
+class TemporalDecisionHead(nn.Module):
     """
-    训练+推理两用的决策头。
-    
-    训练时：使用概率期望（可微，可以训练分类器）
-    推理时：使用无参的early stop逻辑（找到第一个概率>threshold的层）
-    
-    优势：
-    - 训练时端到端可微
-    - 推理时无需调参，固定阈值0.5
-    - 符合工业现场的early stop需求
+    训练/推理一致性决策头。
+
+    每个时间步 t 用全部历史均值 + 当前层特征 + lookahead 特征，
+    预测 t 是否为首次穿透层（t >= pen_t → 1，t < pen_t → 0）。
+
+    - 训练：BCE loss 在 causal 累积标签上
+    - 推理：找第一个 prob > threshold 的位置
+    - 两者的 forward 逻辑完全一致，不存在训练/推理 gap
+
+    Args:
+        d_model: transformer 输出维度
+        lookback: 历史累积层数（设大值，使用全部历史；当前实现为 full lookback）
+        lookahead: 向前看几层（默认 2）
+        threshold: 推理阈值
     """
 
     def __init__(
         self,
         d_model: int = 128,
-        use_attention: bool = True,
-        t_max: int = 300,
-        inference_threshold: float = 0.5,
+        lookback: int = 999,   # 设大值表示全部历史
+        lookahead: int = 2,
+        threshold: float = 0.5,
     ) -> None:
         super().__init__()
         self.d_model = d_model
-        self.t_max = t_max
-        self.inference_threshold = inference_threshold
+        self.lookback = lookback
+        self.lookahead = lookahead
+        self.threshold = threshold
+
+        # ctx = [prob_ctx(4) + history_mean(d) + current(d) + future(d)] = 4 + 3d
+        self.proj = nn.Sequential(
+            nn.Linear(d_model * 3 + 4, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
 
     def forward(
         self,
         z: torch.Tensor,
         logits: torch.Tensor,
         frame_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> dict:
         """
-        自动选择训练/推理模式：
-        - 训练时(self.training=True): 用概率期望（可微）
-        - 推理时(self.training=False): 用first-above-threshold（无参early stop）
-        
         z: (B, T, d_model) — transformer 输出
-        logits: (B, 2, T) — 原始分类 logits  
+        logits: (B, 2, T) — 原始二分类 logits
         frame_mask: (B, T, F) — 帧有效掩码
 
         Returns:
-            pred_idx: (B,) — 预测的 0-based 层索引
+            dict with keys:
+              - decision_logits: (B, T) — 决策头对每个时间步的 logits
+              - decision_probs: (B, T) — 决策头对每个时间步的概率 (0..1)
+              - pred_idx: (B,) — 推理决策：第一个 prob > threshold 的位置
         """
-        if self.training:
-            # 训练模式：概率期望（可微）
-            return self.forward_training(z, logits, frame_mask)
-        else:
-            # 推理模式：first-above-threshold（无参early stop）
-            return self._find_first_above_threshold_batch(logits, frame_mask)
+        decision_logits, decision_probs = self._compute_decision_logits(z, logits)
+        pred_idx = self._find_first_above_threshold(decision_probs, frame_mask)
+        return {
+            "decision_logits": decision_logits,
+            "decision_probs": decision_probs,
+            "pred_idx": pred_idx,
+        }
 
-    def _find_first_above_threshold_batch(
-        self,
-        logits: torch.Tensor,
-        frame_mask: torch.Tensor | None = None,
-        threshold: float = 0.5,
-    ) -> torch.Tensor:
-        """
-        批量推理模式：从前往后扫，找到第一个概率>threshold的层
-        
-        这是一个无参操作，固定阈值0.5。
-        符合工业现场的early stop需求。
-        """
-        b, _, t = logits.shape
-        
-        raw_prob = F.softmax(logits, dim=1)[:, 1]  # (B, T)
-        
-        if frame_mask is not None:
-            mask_2d = frame_mask.any(dim=2)  # (B, T)
-        else:
-            mask_2d = torch.ones(b, t, dtype=torch.bool, device=logits.device)
-
-        indices = torch.arange(t, device=logits.device).unsqueeze(0)  # (1, T)
-        
-        pred_idx = torch.zeros(b, device=logits.device)
-        
-        for bi in range(b):
-            first_idx = -1
-            for ti in range(t):
-                if mask_2d[bi, ti] and raw_prob[bi, ti] > threshold:
-                    first_idx = ti
-                    break
-            if first_idx >= 0:
-                pred_idx[bi] = float(first_idx)
-            else:
-                # Fallback: 概率期望
-                valid_mask = mask_2d[bi]
-                valid_prob = raw_prob[bi][valid_mask]
-                if valid_prob.numel() > 0:
-                    valid_indices = indices[0][valid_mask]
-                    valid_prob_norm = valid_prob / valid_prob.sum().clamp(min=1e-8)
-                    pred_idx[bi] = (valid_prob_norm * valid_indices).sum()
-                else:
-                    pred_idx[bi] = 0.0
-        
-        return pred_idx
-
-    def forward_training(
+    def _compute_decision_logits(
         self,
         z: torch.Tensor,
         logits: torch.Tensor,
-        frame_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        每个时间步 t：
+          - 基础概率 prob_base = softmax(logits)[:, 1]
+          - 累积历史均值 prob_cummean = mean(prob_base[:, 0..t])   ← 因果累积
+          - 当前层 + lookahead 层概率
+          - Transformer 特征 (history_mean + current + future)
+        用 2 层 MLP 融合上述全部信息，输出每个 t 是否为穿透层。
+
+        训练标签（causal cumulative）：
+          causal_label[b, t] = 1 if t >= pen_t[b] else 0
+        推理：找第一个 prob > threshold。
+
+        Returns (decision_logits, decision_probs), both (B, T).
+        """
+        b, t, d = z.shape
+        device = z.device
+
+        # ---- 1. 原始分类概率（原始模型已学好的穿透信号） ----
+        prob_base = torch.softmax(logits, dim=1)[:, 1]  # (B, T)
+
+        # ---- 2. 概率的历史累积均值（causal cumsum） ----
+        # cummean[b, t] = mean(prob_base[b, 0..t])，shape (B, T)
+        prob_cumsum = prob_base.cumsum(dim=1)
+        count = torch.arange(1, t + 1, device=device, dtype=z.dtype)
+        prob_cummean = prob_cumsum / count.unsqueeze(0)  # (B, T)
+
+        # ---- 3. 当前层 + lookahead 层概率 ----
+        # prob_current = prob_base  (B, T)
+        prob_future = F.pad(prob_base[:, 2:], (0, 2), mode="replicate")  # (B, T)
+
+        # ---- 4. Transformer 特征的因果聚合 ----
+        # prefix_sum[b, i] = sum_{j=0..i} z[b, j]
+        prefix_sum = z.cumsum(dim=1)
+        cnt = torch.arange(1, t + 1, device=device, dtype=z.dtype).unsqueeze(0).unsqueeze(-1)
+        history_mean = prefix_sum / cnt.clamp(min=1)   # (B, T, d)
+        current = z                                    # (B, T, d)
+        future = F.pad(z[:, 2:, :], (0, 0, 0, 2), mode="replicate")  # (B, T, d)
+
+        # ---- 5. 全部拼在一起：概率标量 + Transformer 特征 ----
+        # prob: 4 个标量 (cummean, current, lookahead) → expand 成 (B, T, 4)
+        prob_ctx = torch.stack([
+            prob_cummean,                    # 因果累积均值
+            prob_base,                        # 当前层概率
+            prob_future,                      # lookahead 层概率
+            prob_cummean * prob_base,         # 交互项
+        ], dim=-1)                             # (B, T, 4)
+
+        # concat: (B, T, 4 + d + d + d) = (B, T, 4 + 3d)
+        ctx = torch.cat([
+            prob_ctx,      # (B, T, 4)
+            history_mean,  # (B, T, d)
+            current,       # (B, T, d)
+            future,        # (B, T, d)
+        ], dim=-1)      # (B, T, 4 + 3d)
+
+        raw = self.proj(ctx).squeeze(-1)  # (B, T)
+
+        decision_probs = torch.sigmoid(raw)  # (B, T)
+
+        return raw, decision_probs
+
+    def _find_first_above_threshold(
+        self,
+        probs: torch.Tensor,
+        frame_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         """
-        训练时使用的版本：用概率期望（可微）
-        
-        这样分类器可以学到更好的概率分布。
-        """
-        b, t, _ = z.shape
-        
-        raw_prob = F.softmax(logits, dim=1)[:, 1]  # (B, T)
-        
-        if frame_mask is not None:
-            mask_2d = frame_mask.any(dim=2)
-            raw_prob = raw_prob.masked_fill(~mask_2d, 0.0)
-        else:
-            mask_2d = torch.ones(b, t, dtype=torch.bool, device=z.device)
+        推理决策：找第一个 prob > threshold 的位置（batch 并行）。
+        训练时不用这个，由 BCE loss 覆盖。
 
-        # 概率期望
-        indices = torch.arange(t, device=logits.device, dtype=logits.dtype)
-        prob_sum = raw_prob.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        prob_norm = raw_prob / prob_sum
-        pred_idx = (prob_norm * indices.unsqueeze(0)).sum(dim=1)
-        
-        return pred_idx
+        Returns: pred_idx (B,)
+        """
+        b, t = probs.shape
+        device = probs.device
+
+        if frame_mask is not None:
+            mask_2d = frame_mask.any(dim=2)  # (B, T)
+        else:
+            mask_2d = torch.ones(b, t, dtype=torch.bool, device=device)
+
+        # 扩展一列用于 fallback（全 False 时 argmax 返回 0）
+        probs_ext = F.pad(probs, (0, 1), value=0.0)     # (B, T+1)
+        mask_ext = F.pad(mask_2d, (0, 1), value=False)  # (B, T+1)
+
+        above = (probs_ext > self.threshold) & mask_ext  # (B, T+1)
+        first_above = above.long().argmax(dim=1)          # (B,)
+        fallback = ~above.any(dim=1)
+        first_above = torch.where(fallback, torch.full_like(first_above, t), first_above)
+        return first_above.float()  # (B,)
 
 
 class AttentionPooling(nn.Module):
@@ -324,11 +357,72 @@ class FrameLevelTCNWithAttn(nn.Module):
         pooled = pooled.reshape(b, t, -1).transpose(1, 2)  # (B, D, T)
         return pooled
 
+    # ------------------------------------------------------------------
+    # Streaming support: persist GRU hidden state across steps
+    # ------------------------------------------------------------------
+
+    def reset_hidden(self) -> None:
+        """Reset streaming state. Call before starting a new well."""
+        if self.use_gru:
+            self._gru_h = None  # (num_layers, B, D)
+
+    def forward_step(
+        self,
+        x_step: torch.Tensor,
+        frame_mask_step: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Streaming forward: process one layer's frame batch at a time.
+
+        Persists GRU hidden state across steps. Call reset_hidden() once
+        before the first step of each new well.
+
+        Args:
+            x_step: (B, 1, F, C) — one layer's frame features
+            frame_mask_step: (B, 1, F) — mask for this step's frames
+
+        Returns:
+            pooled: (B, D, 1) — frame-level features for this layer
+        """
+        b, t, f, c = x_step.shape  # t==1 for step mode
+        y = x_step.reshape(b * t, f, c).transpose(1, 2)  # (B, C, F)
+
+        for blk in self.tcn_blocks:
+            y = blk(y)
+
+        y = y.transpose(1, 2)  # (B, F, D)
+
+        if self.use_gru:
+            if frame_mask_step is not None:
+                m = frame_mask_step.reshape(b * t, f)
+                lengths = m.sum(dim=1).clamp(min=1).long().cpu()
+                y_packed = rnn.pack_padded_sequence(y, lengths, batch_first=True, enforce_sorted=False)
+                _, h = self.gru(y_packed, self._gru_h)
+                self._gru_h = h.detach() if self._gru_h is not None else h
+            else:
+                _, h = self.gru(y, self._gru_h)
+                self._gru_h = h.detach() if self._gru_h is not None else h
+            pooled = h[-1]  # (B, D)
+            pooled = self.gru_proj(pooled)
+        else:
+            if frame_mask_step is not None:
+                m = frame_mask_step.reshape(b * t, f).unsqueeze(-1).float()
+                pooled = (y * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+            else:
+                pooled = y.mean(dim=1)
+            if self.tcn_out_dim != self.out_dim:
+                pooled = self.gru_proj(pooled.unsqueeze(1)).squeeze(1)
+
+        pooled = pooled.reshape(b, 1, -1)  # (B, 1, D)
+        pooled = pooled.transpose(1, 2)     # (B, D, 1)
+        return pooled
+
 
 class MultiScaleFrameEncoder(nn.Module):
     """
     Multi-scale feature extraction from frame sequence.
     Extracts features at different temporal scales and fuses them.
+    Supports lookahead of multiple future layers for forward-looking decision making.
     """
 
     def __init__(
@@ -336,6 +430,7 @@ class MultiScaleFrameEncoder(nn.Module):
         in_channels: int = 768,       # 768 for DINOv3 ViT-B, 192 for hand-crafted grid
         out_channels: int = 128,       # wider to handle richer features
         kernel_size: int = 3,
+        use_lookahead: bool = True,
     ) -> None:
         super().__init__()
         self.conv1 = nn.Conv1d(int(in_channels), int(out_channels), kernel_size=int(kernel_size), padding=1)
@@ -349,6 +444,11 @@ class MultiScaleFrameEncoder(nn.Module):
         self.act = nn.ReLU(inplace=True)
         self.fusion = nn.Linear(int(out_channels) * 3, int(out_channels))
         self.attn_pool = AttentionPooling(int(out_channels))
+
+        self.use_lookahead = use_lookahead
+        self.lookahead_depth = 2  # number of future layers to look ahead
+        if use_lookahead:
+            self.lookahead_proj = nn.Conv1d(int(out_channels) * (1 + self.lookahead_depth), int(out_channels), kernel_size=1)
 
     def forward(self, x: torch.Tensor, frame_mask: torch.Tensor | None = None) -> torch.Tensor:
         b, t, f, c = x.shape
@@ -372,6 +472,18 @@ class MultiScaleFrameEncoder(nn.Module):
         fused = self.fusion(fused)
         
         fused = fused.reshape(b, t, -1).transpose(1, 2)
+        if self.use_lookahead and self.lookahead_depth > 0:
+            expected_in = fused.shape[1] * (1 + self.lookahead_depth)
+            if self.lookahead_proj.in_channels != expected_in:
+                self.lookahead_proj = nn.Conv1d(expected_in, fused.shape[1], kernel_size=1).to(fused.device)
+            # Pad sequence dim (last dim) so that shift=k can safely read padded[:,:,k:k+t]
+            padded = F.pad(fused, (0, self.lookahead_depth), mode="constant", value=0.0)  # (B, D, T+depth)
+            shifted_list = [fused]
+            for shift in range(1, self.lookahead_depth + 1):
+                sliced = padded[:, :, shift:shift + t]  # (B, D, T)
+                shifted_list.append(sliced)
+            fused = torch.cat(shifted_list, dim=1)       # (B, (1+depth)*D, T)
+            fused = self.lookahead_proj(fused)            # (B, D, T)
         return fused
 
 
@@ -421,6 +533,7 @@ class HierarchicalGridDiffProbTransformer(nn.Module):
                 in_channels=int(in_channels_frame),
                 out_channels=layer_tcn_channels[0] if layer_tcn_channels else d_model,
                 kernel_size=kernel_size,
+                use_lookahead=True,
             )
         else:
             self.frame_encoder = FrameLevelTCNWithAttn(
@@ -474,8 +587,8 @@ class HierarchicalGridDiffProbTransformer(nn.Module):
         self.transformer_layers = nn.ModuleList(tf_layers)
         self.head = nn.Conv1d(int(d_model), self.out_channels, kernel_size=1)
 
-        # Learned decision head: can work in batch or streaming mode
-        self.decision_head = LearnedDecisionHead(d_model=int(d_model), use_attention=True)
+        # Temporal decision head: per-step binary classification with context
+        self.decision_head = TemporalDecisionHead(d_model=int(d_model), lookback=1, lookahead=2)
 
     def forward(
         self,
@@ -520,7 +633,9 @@ class HierarchicalGridDiffProbTransformer(nn.Module):
         if self.return_kl and kl_terms:
             ret["kl_loss"] = torch.stack(kl_terms).mean()
         if return_decision_idx:
-            ret["decision_idx"] = self.decision_head(z, logits, frame_mask)  # (B,)
+            dec = self.decision_head(z, logits, frame_mask)
+            ret["decision_idx"] = dec["pred_idx"]           # (B,) — for compat
+            ret["decision_probs"] = dec["decision_probs"]    # (B, T) — for BCE loss
         return ret
 
     # ------------------------------------------------------------------
@@ -530,7 +645,11 @@ class HierarchicalGridDiffProbTransformer(nn.Module):
     def reset_hidden(self) -> None:
         """
         Reset all streaming state. Call this before starting a new well.
+        Resets: frame encoder state, TCN/GRU hidden, transformer KV cache.
         """
+        # Frame-level streaming state (GRU hidden)
+        if hasattr(self.frame_encoder, "reset_hidden"):
+            self.frame_encoder.reset_hidden()
         self._z_seq: list[torch.Tensor] = []
         self._logits_seq: list[torch.Tensor] = []
         self._kv_caches: list[list[torch.Tensor] | None] = [
@@ -565,14 +684,21 @@ class HierarchicalGridDiffProbTransformer(nn.Module):
         if not hasattr(self, "_z_seq"):
             self.reset_hidden()
 
-        z = self.frame_encoder(x_step, frame_mask=frame_mask_step)
-        z = z.squeeze(2) if z.shape[2] == 1 else z  # (B, D) -> squeeze T=1
+        # Frame-level feature for this layer — use streaming method if available,
+        # otherwise fall back to regular forward (safe for statelss encoders)
+        if hasattr(self.frame_encoder, "forward_step"):
+            frame_feat = self.frame_encoder.forward_step(x_step, frame_mask=frame_mask_step)
+        else:
+            frame_feat = self.frame_encoder(x_step, frame_mask=frame_mask_step)
+        # frame_feat: (B, D, 1) per layer
 
-        for li, blk in enumerate(self.layer_tcn):
-            z = blk(z)
+        # TCN blocks: (B, D, 1) → (B, d_model, 1)
+        for blk in self.layer_tcn:
+            frame_feat = blk(frame_feat)
 
-        z = self.proj_in(z)  # (B, d_model)
-        z_step = z.unsqueeze(1)  # (B, 1, d_model)
+        # proj_in: (B, d_model, 1)
+        frame_feat = self.proj_in(frame_feat)  # (B, d_model, 1)
+        z_step = frame_feat.squeeze(2).unsqueeze(1)  # (B, 1, d_model)
 
         if self._step_count == 0:
             z_acc = z_step
@@ -600,7 +726,12 @@ class HierarchicalGridDiffProbTransformer(nn.Module):
         self._logits_seq.append(logits_step)
         self._step_count += 1
 
-        decision_idx = self.decision_head(z_acc, logits_full, frame_mask=None)
+        # decision_head._compute_decision_logits needs T >= 3 (prob_base[:, 2:] and prob_future padding)
+        prob_full_T = logits_full.shape[2]
+        if prob_full_T < 3:
+            decision_idx = torch.zeros(b, device=z_acc.device, dtype=torch.long)
+        else:
+            decision_idx = self.decision_head(z_acc, logits_full, frame_mask=None)["pred_idx"]
 
         return {
             "logits_step": logits_step,

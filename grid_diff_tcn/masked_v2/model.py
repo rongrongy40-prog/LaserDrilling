@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Masked Image Modeling for drilling hole detection (v2 - trainable encoder).
+Two-stage training for drilling hole detection (v2 - Standard MAE pre-training).
 
-Two-stage training:
-  1. Self-supervised: train encoder + decoder to reconstruct masked pixels (encoder UNFROZEN)
-  2. Supervised: fine-tune with classification head (encoder frozen or fine-tuned)
+Stage 1: Standard MAE with FROZEN pretrained encoder
+        - Encoder: DINOv3 pretrained backbone (frozen)
+        - Decoder: Transformer + pixel head, trains to reconstruct masked patches
+        - Benefit: encoder features stay intact; decoder learns domain-adapted representations
 
-Key difference from masked/ (v1):
-  - Encoder is TRAINABLE during Stage 1 MIM, learning domain-specific features
-  - Stage 2 can freeze or fine-tune the learned encoder
+Stage 2: Supervised classification fine-tuning (encoder frozen or fine-tuned)
+        - Encoder: frozen pretrained features (or fine-tuned)
+        - Classifier: Frame TCN + Layer TCN + ProbTransformer head
+        - LearnedDecisionHead for direct layer index prediction
+
+This replaces the old CenterMask + CLS-only PixelDecoder approach which had:
+  - Decoder input was only a single CLS token (no spatial info)
+  - Wrong mask size calculation (30x30 on 224x224 image)
+  - MIM objective unrelated to classification task
 """
 
 from __future__ import annotations
@@ -24,18 +31,20 @@ from grid_diff_tcn.hier.frame_layer.model import HierarchicalGridDiffProbTransfo
 from grid_diff_tcn.hier.frame_layer.dinov3_features import DinoV3FeatureExtractor, DINOV3_MODELS
 from grid_diff_tcn.masked_v2.masks import CenterMask, MaskedImageModelingLoss
 from grid_diff_tcn.masked_v2.decoder import PixelDecoder
+from grid_diff_tcn.masked_v2.mae import StandardMAEPreTrainer
 
 
 class MaskedPixelModel(nn.Module):
     """
     Two-stage model for drilling hole detection with masked image modeling.
 
-    Stage 1: Pre-train encoder + decoder to reconstruct masked pixels
+    Stage 1: Standard MAE pre-training with FROZEN pretrained encoder
+             (replaces old CenterMask + CLS-only PixelDecoder)
     Stage 2: Fine-tune with classification head
 
     Architecture:
-    - DINOv3 encoder (TRAINABLE during Stage 1 MIM in v2 - key difference from v1)
-    - Pixel decoder (for stage 1 reconstruction)
+    - DINOv3 encoder (FROZEN during Stage 1 - uses pretrained features directly)
+    - MAE decoder: visible patches + mask tokens → per-patch pixel reconstruction
     - Frame encoder + Layer TCN + Classification head (for stage 2)
     """
     
@@ -54,13 +63,16 @@ class MaskedPixelModel(nn.Module):
         dropout: float = 0.1,
         add_kl: bool = True,
         use_multiscale: bool = True,
-        freeze_encoder: bool = False,
+        freeze_encoder: bool = True,
         mask_ratio: float = 0.75,
         mask_shape: str = "circle",
         decoder_hidden_dim: int = 512,
         stage: int = 2,
         dinov3_chunk_size: int = 4,
         use_cached_features: bool = False,
+        mae_decoder_dim: int = 256,
+        mae_decoder_depth: int = 4,
+        mae_decoder_heads: int = 6,
     ) -> None:
         super().__init__()
         self.stage = int(stage)
@@ -70,21 +82,13 @@ class MaskedPixelModel(nn.Module):
         self.freeze_encoder = bool(freeze_encoder)
         self.dinov3_chunk_size = int(dinov3_chunk_size)
         self.use_cached_features = bool(use_cached_features)
+        self.mask_ratio = float(mask_ratio)
 
         # Stage 2 inference with pre-extracted features: skip encoder/decoder to save memory.
-        # Stage 1 MIM or Stage 2 with raw images: always build encoder + decoder.
+        # Stage 1 MIM or Stage 2 with raw images: always build encoder + MAE decoder.
         if self.use_cached_features and self.stage == 2:
-            # Feature extraction is done externally; model only needs classifier.
             pass
         else:
-            mask_size = int(dinov3_roi_size * (1 - mask_ratio ** 0.5))
-            self.mask_size = mask_size
-            self.center_mask = CenterMask(
-                mask_ratio=float(mask_ratio),
-                mask_shape=str(mask_shape),
-                image_size=int(dinov3_roi_size),
-            )
-
             self.dinov3_extractor = DinoV3FeatureExtractor(
                 model_name=str(dinov3_model),
                 pretrained=True,
@@ -92,18 +96,17 @@ class MaskedPixelModel(nn.Module):
                 image_size=int(dinov3_roi_size),
             )
 
-            if self.freeze_encoder:
-                for param in self.dinov3_extractor.parameters():
-                    param.requires_grad = False
-
-            self.pixel_decoder = PixelDecoder(
+            # Standard MAE pre-trainer: frozen encoder + trainable MAE decoder
+            self.mae_pretrainer = StandardMAEPreTrainer(
+                encoder=self.dinov3_extractor.backbone,
                 encoder_dim=int(dinov3_feat_dim),
-                hidden_dim=int(decoder_hidden_dim),
-                output_channels=3,
-                output_size=mask_size,
+                patch_size=16,
+                image_size=int(dinov3_roi_size),
+                mask_ratio=float(mask_ratio),
+                decoder_dim=int(mae_decoder_dim),
+                decoder_depth=int(mae_decoder_depth),
+                decoder_heads=int(mae_decoder_heads),
             )
-
-            self.mim_loss = MaskedImageModelingLoss(loss_type="l1")
         
         self.classifier = HierarchicalGridDiffProbTransformer(
             in_channels_frame=int(dinov3_feat_dim),
@@ -125,47 +128,19 @@ class MaskedPixelModel(nn.Module):
         images: torch.Tensor,
     ) -> dict:
         """
-        Forward pass for stage 1 (pre-training).
+        Forward pass for stage 1: Standard MAE pre-training.
         
         Args:
-            images: (N, 3, H, W) - ROI images, processed in chunks to save memory
+            images: (N, 3, H, W) - ROI images
         
         Returns:
             dict with keys:
-                - loss: scalar MIM loss
+                - loss: scalar MAE loss
                 - pred: (N, 3, H, W) reconstructed pixels
                 - target: (N, 3, H, W) original pixels
-                - mask: (N, H, W) boolean mask (True = masked region)
+                - mask_img: (N, H, W) float mask (1=masked, 0=visible)
         """
-        N = images.shape[0]
-        H, W = images.shape[2], images.shape[3]
-        
-        masked_images, mask = self.center_mask(images, return_mask=True)
-        
-        chunk_size = self.dinov3_chunk_size
-        all_features = []
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            chunk = masked_images[start:end]
-            feat = self.dinov3_extractor(chunk)
-            all_features.append(feat)
-        features = torch.cat(all_features, dim=0)
-        
-        pred = self.pixel_decoder(features)  # (N, 3, mask_size, mask_size)
-        
-        target = images
-        
-        if pred.shape[-1] != target.shape[-1] or pred.shape[-2] != target.shape[-2]:
-            pred = F.interpolate(
-                pred,
-                size=(H, W),
-                mode="bilinear",
-                align_corners=False,
-            )
-        
-        loss = self.mim_loss(pred, target, mask)
-        
-        return {"loss": loss, "pred": pred, "target": target, "mask": mask}
+        return self.mae_pretrainer(images, return_loss=True)
     
     def forward_stage2(
         self,
@@ -340,10 +315,21 @@ class MaskedPixelModel(nn.Module):
 
     def set_encoder_trainable(self, trainable: bool) -> None:
         """
-        Enable or disable encoder gradient (for Stage 1 vs Stage 2 switching).
+        Enable or disable encoder gradient.
+        Note: encoder is frozen by default (Standard MAE uses pretrained features).
+        Only the MAE decoder is trained in Stage 1.
         """
         if hasattr(self, "dinov3_extractor"):
             for param in self.dinov3_extractor.parameters():
+                param.requires_grad = trainable
+        if hasattr(self, "mae_pretrainer") and hasattr(self.mae_pretrainer, "encoder"):
+            for param in self.mae_pretrainer.encoder.parameters():
+                param.requires_grad = trainable
+
+    def set_mae_trainable(self, trainable: bool) -> None:
+        """Enable or disable MAE decoder gradient (Stage 1 only)."""
+        if hasattr(self, "mae_pretrainer"):
+            for param in self.mae_pretrainer.decoder.parameters():
                 param.requires_grad = trainable
 
     def freeze_classifier(self) -> None:
@@ -368,15 +354,15 @@ def load_masked_model(
     Load a pretrained masked model.
 
     Supports loading Stage 1 checkpoint into Stage 2 model:
-    - Stage 1 weights (dinov3_extractor, pixel_decoder) → Stage 2 model
+    - Stage 1 weights (dinov3_extractor.backbone + mae_pretrainer) → Stage 2 model
     - If finetune_classifier=True: try to load classifier weights from Stage 1 checkpoint
-    - If finetune_classifier=False: classifier is initialized from scratch (default behavior)
+    - If finetune_classifier=False: classifier is initialized from scratch
 
     Args:
         checkpoint_path: path to checkpoint
         stage: 1 or 2
-        unfreeze_encoder: if True, unfreeze encoder after loading (for Stage 2 fine-tuning)
-        finetune_classifier: if True, try to load and finetune Stage 1 classifier weights
+        unfreeze_encoder: if True, unfreeze encoder after loading
+        finetune_classifier: if True, try to load classifier weights
         **kwargs: passed to MaskedPixelModel __init__
 
     Returns:
@@ -395,44 +381,52 @@ def load_masked_model(
     loaded_keys = set()
 
     if int(stage) == 2:
-        encoder_keys = [k for k in pretrained_sd if k.startswith("dinov3_extractor.") or k.startswith("pixel_decoder.")]
-
         matched = {}
-        for k in encoder_keys:
-            model_key = k.replace("dinov3_extractor.", "dinov3_extractor.").replace("pixel_decoder.", "pixel_decoder.")
-            if model_key in model.state_dict():
-                matched[model_key] = pretrained_sd[k]
-                loaded_keys.add(k)
+        model_sd = model.state_dict()
+
+        # 1. MAE decoder weights: mae_pretrainer.decoder.xxx → mae_pretrainer.decoder.xxx
+        for k in pretrained_sd:
+            if k.startswith("mae_pretrainer."):
+                if k in model_sd:
+                    if model_sd[k].shape == pretrained_sd[k].shape:
+                        matched[k] = pretrained_sd[k]
+                        loaded_keys.add(k)
+
+        # 2. Encoder backbone: dinov3_extractor.backbone.xxx → dinov3_extractor.backbone.xxx
+        for k in pretrained_sd:
+            if k.startswith("dinov3_extractor.backbone."):
+                if k in model_sd:
+                    if model_sd[k].shape == pretrained_sd[k].shape:
+                        matched[k] = pretrained_sd[k]
+                        loaded_keys.add(k)
 
         mismatched = model.load_state_dict(matched, strict=False)
         for k in mismatched.missing_keys:
-            print(f"  [load] warning: missing key: {k}")
+            print(f"  [load] missing key (not in checkpoint): {k}")
         for k in mismatched.unexpected_keys:
-            print(f"  [load] warning: unexpected key: {k}")
+            print(f"  [load] unexpected key (not in model): {k}")
 
-        print(f"  [load] Stage1→Stage2: loaded {len(loaded_keys)} encoder/decoder keys")
+        print(f"  [load] Stage1→Stage2: loaded {len(matched)} keys "
+              f"(encoder={sum(1 for k in matched if 'backbone' in k)}, "
+              f"mae_decoder={sum(1 for k in matched if 'mae_pretrainer.decoder' in k)})")
 
-        # Try to load classifier weights for finetuning
+        # Try to load classifier weights
         if finetune_classifier:
-            classifier_keys = [k for k in pretrained_sd if k.startswith("classifier.")]
-            if classifier_keys:
-                classifier_matched = {}
-                for k in classifier_keys:
-                    model_key = k.replace("classifier.", "classifier.")
-                    if model_key in model.state_dict():
-                        # Check shape compatibility
-                        if model.state_dict()[model_key].shape == pretrained_sd[k].shape:
-                            classifier_matched[model_key] = pretrained_sd[k]
+            classifier_matched = {}
+            for k in pretrained_sd:
+                if k.startswith("classifier."):
+                    if k in model_sd:
+                        if model_sd[k].shape == pretrained_sd[k].shape:
+                            classifier_matched[k] = pretrained_sd[k]
                             loaded_keys.add(k)
                         else:
-                            print(f"  [load] skip classifier.{k[len('classifier.'):]}: shape mismatch "
-                                  f"(checkpoint: {pretrained_sd[k].shape}, model: {model.state_dict()[model_key].shape})")
-                
-                if classifier_matched:
-                    model.load_state_dict(classifier_matched, strict=False)
-                    print(f"  [load] Stage1→Stage2: loaded {len(classifier_matched)} classifier keys for finetuning")
-                else:
-                    print(f"  [load] Stage1→Stage2: no compatible classifier keys found, using initialized weights")
+                            print(f"  [load] skip classifier.{k[11:]}: shape mismatch")
+
+            if classifier_matched:
+                model.load_state_dict(classifier_matched, strict=False)
+                print(f"  [load] Stage1→Stage2: loaded {len(classifier_matched)} classifier keys")
+            else:
+                print(f"  [load] Stage1→Stage2: no compatible classifier keys, using initialized weights")
 
         if unfreeze_encoder and hasattr(model, "dinov3_extractor"):
             for param in model.dinov3_extractor.parameters():

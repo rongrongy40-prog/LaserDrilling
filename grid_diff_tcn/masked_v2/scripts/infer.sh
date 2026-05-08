@@ -8,9 +8,6 @@ set -euo pipefail
 #   bash grid_diff_tcn/masked_v2/scripts/infer.sh test
 #   bash grid_diff_tcn/masked_v2/scripts/infer.sh train
 #
-# 验证集调参 + 测试集推理:
-#   RUN_VAL=1 bash grid_diff_tcn/masked_v2/scripts/infer.sh test
-#
 # 在线 ROI 裁剪（不使用缓存）:
 #   ONLINE_CROP=1 bash grid_diff_tcn/masked_v2/scripts/infer.sh test
 #
@@ -28,11 +25,6 @@ set -euo pipefail
 #   LOCK_LAYERS=30             安全锁层数
 #   GRID_SEARCH_OUTPUT=...      网格搜索结果 JSON 输出路径
 #
-# 流式推理（边读边预测，一旦检测到穿透就停止）:
-#   STREAMING=1                开启流式推理（early stopping）
-#   STOP_THRESH=0.5            穿透概率阈值，达到即认为是穿透
-#   STOP_WAIT=3               连续 STOP_WAIT 帧超过阈值才确认穿透
-#   MAX_INFERENCE_LAYERS=50    最大处理层数（超过则强制停止，用于非穿透孔）
 # ============================================================
 
 # ---- CPU 模式（默认自动选择）----
@@ -48,10 +40,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 # ---- Split ----
 SPLIT="${1:-test}"
 if [[ "${SPLIT}" == "train" ]]; then
-  SAMPLES_INFO="data_drilling/samples_info_train.json"
+  SAMPLES_INFO="data_drilling/samples_info_train_split.json"
   OUTPUT_CSV="grid_diff_tcn/masked_v2/inference_results_train.csv"
 elif [[ "${SPLIT}" == "test" ]]; then
-  SAMPLES_INFO="data_drilling/samples_info_test.json"
+  SAMPLES_INFO="data_drilling/samples_info_test_split.json"
   OUTPUT_CSV="grid_diff_tcn/masked_v2/inference_results_test.csv"
 else
   echo "ERROR: Unknown split '${SPLIT}'. Use 'train' or 'test'."
@@ -67,7 +59,7 @@ PRECOMPUTED_DIR="${PRECOMPUTED_DIR:-}"
 DINOV3_MODEL="${DINOV3_MODEL:-vit_small}"
 DINOV3_FEAT_DIM="${DINOV3_FEAT_DIM:-384}"
 DINOV3_ROI_SIZE="${DINOV3_ROI_SIZE:-224}"
-DINOV3_CHUNK_SIZE="${DINOV3_CHUNK_SIZE:-32}"
+DINOV3_CHUNK_SIZE="${DINOV3_CHUNK_SIZE:-256}"
 
 # ---- 模型 ----
 D_MODEL="${D_MODEL:-128}"
@@ -78,25 +70,25 @@ MASK_RATIO="${MASK_RATIO:-0.75}"
 MASK_SHAPE="${MASK_SHAPE:-circle}"
 
 # ---- 推理 ----
-BATCH_SIZE="${BATCH_SIZE:-4}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 DECISION_METHOD="${DECISION_METHOD:-s3wd}"
 LOCK_LAYERS="${LOCK_LAYERS:-30}"
-PRELOAD="${PRELOAD:-1}"
+PRELOAD="${PRELOAD:-0}"
 
 # ---- 调试 ----
-MAX_SAMPLES="${MAX_SAMPLES:-}"
+MAX_SAMPLES="${MAX_SAMPLES:-20}"
 
 # ---- S3WD / 决策参数 ----
 S3WD_WAIT="${S3WD_WAIT:-3}"
 S3WD_THRESH="${S3WD_THRESH:-0.6}"
-S3WD_ACCEPT="${S3WD_ACCEPT:-0.4}"
+S3WD_ACCEPT="${S3WD_ACCEPT:-0.7}"
 
 # ---- 流式推理（early stopping）----
 STREAMING="${STREAMING:-0}"
-STOP_THRESH="${STOP_THRESH:-0.5}"
+STOP_THRESH="${STOP_THRESH:-0.6}"
 STOP_WAIT="${STOP_WAIT:-3}"
-MAX_INFERENCE_LAYERS="${MAX_INFERENCE_LAYERS:-}"
+MAX_INFERENCE_LAYERS="${MAX_INFERENCE_LAYERS:-12}"
 
 # ---- 验证集调参 ----
 RUN_VAL="${RUN_VAL:-0}"
@@ -106,7 +98,7 @@ SKIP_GRID_SEARCH="${SKIP_GRID_SEARCH:-0}"
 
 
 # ---- 其他推理参数 ----
-MAX_FRAMES_PER_LAYER="${MAX_FRAMES_PER_LAYER:-10}"
+MAX_FRAMES_PER_LAYER="${MAX_FRAMES_PER_LAYER:-12}"
 
 mkdir -p "$(dirname "${OUTPUT_CSV}")"
 
@@ -130,7 +122,7 @@ ARGS=(
   --lock_layers "$LOCK_LAYERS"
   --max_frames_per_layer "$MAX_FRAMES_PER_LAYER"
   --s3wd_wait "$S3WD_WAIT"
-  --s3wd_thresh "$S3WD_THRESH"
+  --s3wd_threshold "$S3WD_THRESH"
   --s3wd_accept "$S3WD_ACCEPT"
 )
 
@@ -187,7 +179,7 @@ echo "stop_wait       : $STOP_WAIT"
 echo "max_inference   : ${MAX_INFERENCE_LAYERS:-all}"
 fi
 echo "s3wd_wait        : $S3WD_WAIT"
-echo "s3wd_thresh      : $S3WD_THRESH"
+echo "s3wd_threshold   : $S3WD_THRESH"
 echo "s3wd_accept      : $S3WD_ACCEPT"
 echo "lock_layers      : $LOCK_LAYERS"
 echo "batch_size       : $BATCH_SIZE"

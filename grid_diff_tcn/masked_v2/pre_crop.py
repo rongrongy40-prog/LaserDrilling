@@ -6,10 +6,14 @@
     - mask:    (T, F) bool tensor，表示哪些位置有效
     - layers:  (T,) list[int]，每层的实际编号
 
-使用方式：
-    python pre_crop.py --samples_info data_drilling/samples_info_train_split.json \
-                       --cache_dir data_drilling/roi_cache \
-                       --roi_size 224 --max_frames 8 --max_workers 8
+使用方式（固定 box 策略）：
+    python -m grid_diff_tcn.masked_v2.pre_crop \
+        --samples_info data_drilling/samples_info_train_split.json \
+        --cache_dir data_drilling/roi_cache \
+        --skip_layers 30 \
+        --num_anchor_frames 20 \
+        --roi_size 64 \
+        --max_frames 8 --max_workers 8
 
 cache_dir 结构：
     cache_dir/
@@ -43,88 +47,166 @@ from grid_diff_tcn.common.image_ops import (
     load_image_as_float,
     to_grayscale,
     _color_cc_resolve_box,
-    _crop,
     _resize_rgb_letterbox,
 )
-from grid_diff_tcn.common.roi_crop_defaults import norm_roi_window_side
 
 # ---------------------- 裁剪逻辑（模块级，供多进程调用） ----------------------
 
 
-def _crop_one_image(
-    img_path: str,
-    roi_size: int,
-    final_roi_scale: float,
+def _clamp(val, lo, hi):
+    return max(lo, min(hi, int(val)))
+
+
+def _gather_anchor_boxes(
+    sample_path: str,
+    layer_start: int,
+    num_anchor_frames: int,
     cc_min_area: int,
     cc_expand_ratio: float,
-    min_laser_pixels: int,
-    min_laser_area_ratio: float,
-    roi_window_side: int,
-    use_color_cc_v2_geometry: bool,
-) -> np.ndarray | None:
-    """裁剪单张图，返回 float32 [0,1] (H,W,3) 或 None。"""
-    img = load_image_as_float(img_path, (roi_size, roi_size))
-    if img is None:
+    final_roi_scale: float,
+):
+    """
+    策略：
+      1. 从 layer_start 层起按 frame 顺序扫描，检测 box
+      2. 过滤异常大的框（> 中位数 * 2.5）
+      3. 累计够 num_anchor_frames 个后计算并集；不够则用现有全部
+    返回 (fixed_box | None, list_of_valid_boxes, h_img, w_img)
+    """
+    all_files = glob(os.path.join(sample_path, "*.jpg"))
+
+    # 收集 layer >= layer_start 层，按 (layer, frame) 排序
+    rows: list[tuple[int, int, str]] = []
+    for p in all_files:
+        fn = os.path.basename(p)
+        parts = fn.replace(".jpg", "").split("_")
+        if len(parts) < 2:
+            continue
+        try:
+            frame = int(parts[-2])
+            layer = int(parts[-1])
+        except ValueError:
+            continue
+        if layer >= layer_start:
+            rows.append((layer, frame, p))
+
+    rows.sort()  # 按 (layer, frame) 排序
+
+    valid_boxes: list[tuple] = []
+    h_img, w_img = 0, 0
+
+    for layer, frame, path in rows:
+        img = load_image_as_float(path, None)
+        if img is None:
+            continue
+        gray = to_grayscale(img)
+        h_img, w_img = gray.shape[:2]
+        box = _color_cc_resolve_box(
+            rgb01=img,
+            gray=gray,
+            final_roi_scale=final_roi_scale,
+            cc_min_area=cc_min_area,
+            cc_expand_ratio=cc_expand_ratio,
+            use_color_cc_v2_geometry=True,
+            min_laser_pixels=0,
+            min_laser_area_ratio=0.0,
+            roi_window_side=None,
+        )
+        if box is None:
+            continue
+
+        valid_boxes.append(box)
+
+        if len(valid_boxes) == num_anchor_frames:
+            break
+
+    if not valid_boxes:
+        return None, [], h_img, w_img
+
+    # 两遍过滤：先算中位数，再用 1.5x 阈值（比 2.5x 更严格）
+    areas = np.array([(b[2]-b[0])*(b[3]-b[1]) for b in valid_boxes], dtype=float)
+    med = np.median(areas) if len(areas) > 0 else 1.0
+    valid_boxes = [b for b in valid_boxes
+                   if (b[2]-b[0])*(b[3]-b[1]) <= med * 1.5]
+
+    if not valid_boxes:
+        return None, [], h_img, w_img
+
+    x0 = min(b[0] for b in valid_boxes)
+    y0 = min(b[1] for b in valid_boxes)
+    x1 = max(b[2] for b in valid_boxes)
+    y1 = max(b[3] for b in valid_boxes)
+    fixed_box = (x0, y0, x1, y1)
+
+    return fixed_box, valid_boxes, h_img, w_img
+
+
+def _crop_with_fixed_box(img_rgb01, box, roi_size):
+    """用固定 box 裁剪并 resize 到 roi_size。"""
+    h, w = img_rgb01.shape[:2]
+    x0, y0, x1, y1 = box
+    if x1 <= x0 or y1 <= y0:
         return None
-    gray = to_grayscale(img)
-    box = _color_cc_resolve_box(
-        rgb01=img,
-        gray=gray,
-        final_roi_scale=final_roi_scale,
-        cc_min_area=cc_min_area,
-        cc_expand_ratio=cc_expand_ratio,
-        use_color_cc_v2_geometry=use_color_cc_v2_geometry,
-        min_laser_pixels=min_laser_pixels,
-        min_laser_area_ratio=min_laser_area_ratio,
-        roi_window_side=roi_window_side,
-    )
-    if box is None:
+    x0, y0 = _clamp(x0, 0, w), _clamp(y0, 0, h)
+    x1, y1 = _clamp(x1, 0, w), _clamp(y1, 0, h)
+    if x1 <= x0 or y1 <= y0:
         return None
-    roi = _crop(img, box)
-    if roi.size == 0:
+    patch = img_rgb01[y0:y1, x0:x1]
+    if patch.size == 0:
         return None
-    roi = _resize_rgb_letterbox(roi, (roi_size, roi_size), pad_value=0.0)
+    roi = _resize_rgb_letterbox(patch, (roi_size, roi_size), pad_value=0.0)
     return roi.astype(np.float32)
 
 
 def _process_one_sample(args: tuple) -> dict:
     """
-    处理单个孔：收集所有帧的裁剪结果，存为 .pt。
+    处理单个孔：计算固定 box，裁剪所有帧，存为 .pt。
     返回 {"sample_path": ..., "status": "ok"|"skipped"|"error", "detail": ...}
     """
     (sample_path, cache_path, roi_size, max_frames_per_layer,
-     max_layers, final_roi_scale, cc_min_area, cc_expand_ratio,
-     min_laser_pixels, min_laser_area_ratio, roi_window_side,
-     use_color_cc_v2_geometry) = args
+     max_layers, skip_layers, num_anchor_frames,
+     cc_min_area, cc_expand_ratio, final_roi_scale) = args
 
     try:
         # 1. 收集该孔所有图片，按层分组
         by_layer: dict[int, list] = defaultdict(list)
         for p in glob(os.path.join(sample_path, "*.jpg")):
             fn = os.path.basename(p)
-            # 解析文件名：frame_layer 格式
             parts = fn.replace(".jpg", "").split("_")
             if len(parts) < 2:
                 continue
             try:
-                frame = int(parts[0])
-                layer = int(parts[1])
+                frame = int(parts[-2])
+                layer = int(parts[-1])
             except ValueError:
                 continue
-            by_layer[layer].append((frame, p))
+            if layer > skip_layers:
+                by_layer[layer].append((frame, p))
 
         layer_list = sorted(by_layer.keys())
         if max_layers and len(layer_list) > max_layers:
             layer_list = layer_list[:max_layers]
 
-        if not layer_list:
+        if len(layer_list) == 0:
             return {"sample_path": sample_path, "status": "skipped",
-                    "detail": "no layers"}
+                    "detail": "no layers after skip"}
 
         T = len(layer_list)
         F = max_frames_per_layer
 
-        # 2. 为每层采样帧并裁剪
+        # 2. 累计够 20 个有效 ROI 后计算并集作为固定 box
+        fixed_box, anchor_boxes, h_img, w_img = _gather_anchor_boxes(
+            sample_path=sample_path,
+            layer_start=skip_layers + 1,
+            num_anchor_frames=num_anchor_frames,
+            cc_min_area=cc_min_area,
+            cc_expand_ratio=cc_expand_ratio,
+            final_roi_scale=final_roi_scale,
+        )
+        if fixed_box is None:
+            return {"sample_path": sample_path, "status": "skipped",
+                    "detail": f"failed to resolve fixed box (found {len(anchor_boxes)} valid anchors < {num_anchor_frames})"}
+
+        # 3. 用固定 box 裁剪所有帧
         data = np.zeros((T, F, 3, roi_size, roi_size), dtype=np.float32)
         mask = np.zeros((T, F), dtype=bool)
 
@@ -137,36 +219,41 @@ def _process_one_sample(args: tuple) -> dict:
                 picks = [items[i][1] for i in idx]
 
             for fi, p in enumerate(picks[:F]):
-                roi = _crop_one_image(
-                    p, roi_size, final_roi_scale, cc_min_area, cc_expand_ratio,
-                    min_laser_pixels, min_laser_area_ratio, roi_window_side,
-                    use_color_cc_v2_geometry,
-                )
+                img = load_image_as_float(p, None)
+                if img is None:
+                    continue
+                roi = _crop_with_fixed_box(img, fixed_box, roi_size)
                 if roi is None:
                     continue
                 # roi is (H, W, 3) float32 [0,1], convert to (3, H, W)
                 data[ti, fi] = roi.transpose(2, 0, 1)
                 mask[ti, fi] = True
 
-        # 3. 如果所有帧都裁剪失败，跳过
+        # 4. 如果所有帧都裁剪失败，跳过
         if not mask.any():
             return {"sample_path": sample_path, "status": "skipped",
                     "detail": "all crops failed"}
 
-        # 4. 写 .pt
+        # 5. 写 .pt（uint8 存储，体积比 float32 小 4×）
+        frames_uint8 = (data * 255).round().astype(np.uint8)
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         tmp_path = cache_path + ".tmp"
         torch.save({
-            "frames": torch.from_numpy(data),
+            "frames": torch.from_numpy(frames_uint8),
             "mask": torch.from_numpy(mask),
             "layers": layer_list,
             "sample_path": sample_path,
+            "fixed_box": fixed_box,
+            "anchor_boxes": anchor_boxes,
+            "img_size": (h_img, w_img),
+            "_uint8": True,      # 版本标记：新格式为 uint8
+            "_roi_size": roi_size,
         }, tmp_path)
         os.replace(tmp_path, cache_path)
 
         n_valid = int(mask.sum())
         return {"sample_path": sample_path, "status": "ok",
-                "detail": f"T={T} F={F} valid={n_valid}"}
+                "detail": f"T={T} F={F} valid={n_valid} box={fixed_box} anchors={len(anchor_boxes)}"}
 
     except Exception as e:
         return {"sample_path": sample_path, "status": "error",
@@ -176,23 +263,26 @@ def _process_one_sample(args: tuple) -> dict:
 # ---------------------- 主函数 ----------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="预裁剪 ROI 图片到 .pt 缓存")
+    parser = argparse.ArgumentParser(description="预裁剪 ROI 图片到 .pt 缓存（固定 box 策略）")
     parser.add_argument("--samples_info", type=str, required=True)
     parser.add_argument("--cache_dir", type=str, required=True,
                         help="缓存输出目录，一孔一 .pt 文件")
-    parser.add_argument("--roi_size", type=int, default=224)
+    parser.add_argument("--roi_size", type=int, default=64,
+                        help="最终 resize 尺寸（默认 64，大幅节省缓存体积）")
     parser.add_argument("--max_frames", type=int, default=8,
                         help="每层最多保留帧数")
     parser.add_argument("--max_layers", type=int, default=None,
                         help="每孔最多层数（None=不限）")
-    parser.add_argument("--final_roi_scale", type=float, default=0.85)
-    parser.add_argument("--cc_min_area", type=int, default=12)
-    parser.add_argument("--cc_expand_ratio", type=float, default=0.2)
-    parser.add_argument("--min_laser_pixels", type=int, default=0)
-    parser.add_argument("--min_laser_area_ratio", type=float, default=0.0)
-    parser.add_argument("--roi_window_side", type=int, default=None)
-    parser.add_argument("--use_color_cc_v2_geometry", type=lambda x: x.lower() == "true",
-                        default=True)
+    parser.add_argument("--skip_layers", type=int, default=30,
+                        help="跳过前 N 层（默认 30，不考虑穿透前）")
+    parser.add_argument("--num_anchor_frames", type=int, default=20,
+                        help="层31起取连续多少帧来算固定 box（默认 20）")
+    parser.add_argument("--final_roi_scale", type=float, default=0.85,
+                        help="单帧检测时的缩放系数（传给 _color_cc_box）")
+    parser.add_argument("--cc_min_area", type=int, default=12,
+                        help="连通域最小面积")
+    parser.add_argument("--cc_expand_ratio", type=float, default=0.2,
+                        help="box 扩展比例（传给 _color_cc_box）")
     parser.add_argument("--max_workers", type=int, default=None,
                         help="并行进程数，默认为 CPU 核数")
     parser.add_argument("--overwrite", action="store_true",
@@ -202,7 +292,6 @@ def main():
     args = parser.parse_args()
 
     max_workers = args.max_workers or max(1, cpu_count() - 1)
-    roi_window_side = norm_roi_window_side(args.roi_window_side)
 
     # 读取样本列表
     with open(args.samples_info) as f:
@@ -217,27 +306,25 @@ def main():
         sample_path = s.get("sample_path", "")
         if not sample_path:
             continue
-        # cache 文件名：用原始路径的哈希或 basename
-        # 保证不同样本集写到同一 cache 时不冲突
         rel = os.path.relpath(sample_path, os.getcwd())
         safe = rel.replace(os.sep, "_").replace("/", "_")
         cache_path = os.path.join(args.cache_dir, f"{safe}.pt")
 
         if os.path.exists(cache_path) and not args.overwrite:
-            continue  # 已存在，跳过
+            continue
 
         tasks.append((
             sample_path, cache_path,
             args.roi_size, args.max_frames, args.max_layers,
-            args.final_roi_scale, args.cc_min_area, args.cc_expand_ratio,
-            args.min_laser_pixels, args.min_laser_area_ratio,
-            roi_window_side, args.use_color_cc_v2_geometry,
+            args.skip_layers, args.num_anchor_frames,
+            args.cc_min_area, args.cc_expand_ratio, args.final_roi_scale,
         ))
 
     print(f"[pre_crop] 样本数: {len(samples)}, 待处理: {len(tasks)}, "
           f"缓存目录: {args.cache_dir}, 并行进程: {max_workers}")
-    print(f"[pre_crop] roi_size={args.roi_size} max_frames={args.max_frames} "
-          f"max_layers={args.max_layers}")
+    print(f"[pre_crop] roi_size={args.roi_size}  skip_layers={args.skip_layers}  "
+          f"anchor_frames={args.num_anchor_frames}  "
+          f"max_frames={args.max_frames}  max_layers={args.max_layers}")
 
     if args.dry_run:
         print("[pre_crop] dry_run 模式，只打印，不写文件")

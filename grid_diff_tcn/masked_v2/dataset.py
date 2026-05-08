@@ -14,7 +14,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as FF
 from torch.utils.data import Dataset
 
 from grid_diff_tcn.common.roi_crop_defaults import norm_roi_window_side
@@ -293,6 +293,7 @@ class MaskedDrillingDataset(Dataset):
                 "penetration_layer": sample["penetration_layer"],
                 "layer_list": [0],
                 "sample_path": sample_path,
+                "dataset_idx": index,
             }
         
         t = len(layer_list)
@@ -325,6 +326,7 @@ class MaskedDrillingDataset(Dataset):
             "penetration_layer": sample["penetration_layer"],
             "layer_list": layer_list,
             "sample_path": sample_path,
+            "dataset_idx": index,
         }
 
 
@@ -375,6 +377,11 @@ def collate_masked_batch(batch: list) -> dict:
         src_t = len(sl)
         seq_labels_tensor[bi, :src_t] = sl
 
+    dataset_indices = torch.tensor(
+        [item.get("dataset_idx", bi) for bi, item in enumerate(batch)],
+        dtype=torch.long
+    )
+
     return {
         "frame_data": frame_data,
         "frame_mask": frame_mask,
@@ -383,6 +390,7 @@ def collate_masked_batch(batch: list) -> dict:
         "penetration_layers": torch.tensor(penetration_layers, dtype=torch.int64),
         "layer_lists": layer_lists,
         "sample_paths": sample_paths,
+        "dataset_indices": dataset_indices,
     }
 
 
@@ -477,27 +485,51 @@ class CropCacheDataset(Dataset):
             print(f"[CropCacheDataset] Filtered to {len(self.samples)} samples with cached features "
                   f"(from {self.precomputed_dir})")
 
-        # preload 模式：启动时把 .pt 全部加载到内存
-        self._preloaded: List[dict | None] = [None] * len(self.samples)
-        self._feat_preloaded: List[dict | None] = [None] * len(self.samples)
+        # 过滤：只保留有有效 ROI 缓存的样本（缺失或加载失败的 .pt 直接删除）
+        skipped = []
+        valid_samples = []
         if self.preload:
+            # preload 模式：预加载时直接验证，合法则保留，失败则跳过
             from tqdm import tqdm
-            print(f"[CropCacheDataset] Preloading {len(self.samples)} .pt files into RAM...")
+            self._preloaded = [None] * len(self.samples)
+            self._feat_preloaded = [None] * len(self.samples)
+            print(f"[CropCacheDataset] Preloading & validating {len(self.samples)} .pt files...")
             for si, s in enumerate(tqdm(self.samples, desc="Loading cache")):
-                cp = self._cache_map.get(s["sample_path"])
+                sp = s["sample_path"]
+                cp = self._cache_map.get(sp)
                 if cp and os.path.exists(cp):
                     try:
                         self._preloaded[si] = torch.load(cp, map_location="cpu", weights_only=False)
+                        valid_samples.append(s)
                     except Exception:
+                        skipped.append(sp)
                         self._preloaded[si] = None
+                else:
+                    skipped.append(sp)
                 if self.precomputed_dir:
-                    fp = self._feat_map.get(s["sample_path"])
+                    fp = self._feat_map.get(sp)
                     if fp and os.path.exists(fp):
                         try:
                             self._feat_preloaded[si] = torch.load(fp, map_location="cpu", weights_only=False)
                         except Exception:
                             self._feat_preloaded[si] = None
             print("[CropCacheDataset] Preload done.")
+        else:
+            # 非 preload 模式：逐个检查文件是否存在（不完整加载）
+            self._preloaded = [None] * len(self.samples)
+            self._feat_preloaded = [None] * len(self.samples)
+            from tqdm import tqdm
+            for s in tqdm(self.samples, desc="Checking cache"):
+                sp = s["sample_path"]
+                cp = self._cache_map.get(sp)
+                if cp and os.path.exists(cp):
+                    valid_samples.append(s)
+                else:
+                    skipped.append(sp)
+        if skipped:
+            print(f"[CropCacheDataset] Skipped {len(skipped)} samples with missing/unreadable "
+                  f"cache files: {skipped}")
+        self.samples = valid_samples
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -533,11 +565,12 @@ class CropCacheDataset(Dataset):
 
         if cached is None:
             # 缓存不存在，返回零张量（与 MaskedDrillingDataset 空样本格式一致）
+            # 形状: (T, F, 3, H, W) 其中 T=1, F=max_frames_per_layer
             frame_data = torch.zeros(
-                self.max_frames_per_layer, 3, self.roi_size, self.roi_size,
+                1, self.max_frames_per_layer, 3, self.roi_size, self.roi_size,
                 dtype=torch.float32
             )
-            frame_mask = torch.zeros(self.max_frames_per_layer, dtype=torch.bool)
+            frame_mask = torch.zeros(1, self.max_frames_per_layer, dtype=torch.bool)
             seq_label = torch.zeros(1, dtype=torch.int64)
             layer_list = [0]
         else:
@@ -545,6 +578,17 @@ class CropCacheDataset(Dataset):
             raw_frames = cached["frames"]       # (T, F, 3, H, W)
             raw_mask: torch.Tensor = cached["mask"]  # (T, F) bool
             layer_list: list[int] = cached.get("layers", list(range(raw_frames.shape[0])))
+
+            # Handle new uint8+64x64 cache format: convert to float32 and resize
+            if cached.get("_uint8", False):
+                stored_roi_size = cached.get("_roi_size", 64)
+                raw_frames = raw_frames.float() / 255.0  # uint8 → float32 [0,1]
+                if stored_roi_size != self.roi_size:
+                    T, F, C, H, W = raw_frames.shape
+                    flat = raw_frames.permute(0, 1, 3, 4, 2).reshape(T * F, C, H, W)
+                    flat = FF.interpolate(flat, size=(self.roi_size, self.roi_size),
+                                         mode="bilinear", align_corners=False)
+                    raw_frames = flat.reshape(T, F, 3, self.roi_size, self.roi_size)
 
             if self.max_layers and len(layer_list) > self.max_layers:
                 layer_list = layer_list[:self.max_layers]
@@ -578,4 +622,5 @@ class CropCacheDataset(Dataset):
             "penetration_layer": sample["penetration_layer"],
             "layer_list": layer_list,
             "sample_path": sample_path,
+            "dataset_idx": index,
         }
