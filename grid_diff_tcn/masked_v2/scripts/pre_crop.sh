@@ -20,10 +20,10 @@ set -euo pipefail
 # 断点续传：直接重新运行即可，已存在的 .pt 文件会跳过（OVERWRITE=1 重新生成）
 # ============================================================
 
-SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_train_split.json}"
+SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_test_split.json}"
 VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val_split.json}"
 CACHE_DIR="${CACHE_DIR:-data_drilling/roi_cache}"
-ROI_SIZE="${ROI_SIZE:-224}"
+ROI_SIZE="${ROI_SIZE:-128}"
 MAX_FRAMES="${MAX_FRAMES:-15}"
 MAX_LAYERS="${MAX_LAYERS:-}"
 SKIP_LAYERS="${SKIP_LAYERS:-30}"

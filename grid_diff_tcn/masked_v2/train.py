@@ -1280,6 +1280,9 @@ def main():
                         help="S3WD: if prob >= accept, decision is made immediately (skip wait). "
                              "Default 1.0 (disabled). Set to e.g. 0.95 to immediately decide on "
                              "very high confidence frames.")
+    parser.add_argument("--device_ids", type=int, nargs="+", default=None,
+                        help="GPU device IDs to use, e.g. --device_ids 0 1. "
+                             "Defaults to all available GPUs.")
 
     args = parser.parse_args()
     
@@ -1289,7 +1292,10 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device_ids is not None:
+        device = torch.device(f"cuda:{args.device_ids[0]}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     from grid_diff_tcn.masked_v2.dataset import (
@@ -1416,6 +1422,7 @@ def main():
         model = MaskedPixelModel(**model_kwargs)
 
     model = model.to(device)
+    print(f"[main] Using device: {device}")
 
     # Create optimizer: strategy depends on stage and encoder freeze setting
     if args.stage == 1:

@@ -1,4 +1,26 @@
+旧数据上的结果
 [Phase 2 Test] Decision=s3wd  n=299
   pct_within_3: 69.2%
   pct_within_5: 81.3%
   pct_over_10:  8.0%
+
+
+所有数据上的结果
+训练集
+[Inference] Decision=s3wd  n=2094
+  pct_within_3: 79.8%
+  pct_within_5: 89.2%
+  pct_over_10:  3.9%
+验证集
+[Inference] Decision=s3wd  n=443
+  pct_within_3: 79.5%
+  pct_within_5: 88.3%
+  pct_over_10:  5.2%
+
+测试集
+[Inference] Decision=s3wd  n=444
+  pct_within_3: 73.6%
+  pct_within_5: 85.6%
+  pct_over_10:  6.3%
+
+

@@ -20,8 +20,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ---- 数据 ----
-SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_train_split.json}"
-VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val.json}"
+SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_test_split.json}"
+VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val_split.json}"
 OUTPUT_DIR="${OUTPUT_DIR:-grid_diff_tcn/masked_v2/features_cache}"
 
 # ---- DINOv3 ----
@@ -33,8 +33,10 @@ DINOV3_CHUNK_SIZE="${DINOV3_CHUNK_SIZE:-256}"
 # ---- 提取 ----
 BATCH_SIZE="${BATCH_SIZE:-2}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-CHECKPOINT="${CHECKPOINT:-}"
+CHECKPOINT="${CHECKPOINT:-grid_diff_tcn/masked_v2/checkpoints/stage1.pt}"
 CROP_CACHE_DIR="${CROP_CACHE_DIR:-data_drilling/roi_cache}"
+# 多卡: 默认使用所有 GPU，可用 DEVICE_IDS 环境变量覆盖，如 DEVICE_IDS="0"
+DEVICE_IDS="${DEVICE_IDS:-0}"
 
 echo "=============================================="
 echo "Feature Extraction (masked_v2)"
@@ -44,6 +46,7 @@ echo "dinov3_model : $DINOV3_MODEL"
 echo "chunk_size   : $DINOV3_CHUNK_SIZE"
 echo "checkpoint   : ${CHECKPOINT:-(pretrained DINOv3)}"
 echo "crop_cache   : ${CROP_CACHE_DIR:-(none, online cropping)}"
+echo "device_ids   : $DEVICE_IDS"
 echo "=============================================="
 
 ARGS=(
@@ -55,6 +58,7 @@ ARGS=(
   --dinov3_chunk_size "$DINOV3_CHUNK_SIZE"
   --batch_size "$BATCH_SIZE"
   --num_workers "$NUM_WORKERS"
+  --device_ids $DEVICE_IDS
 )
 
 if [[ -n "$CHECKPOINT" && -f "$CHECKPOINT" ]]; then

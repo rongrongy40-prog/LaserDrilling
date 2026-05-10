@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # ---- 数据 ----
 SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_train_split.json}"
-VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val.json}"
+VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val_split.json}"
 
 # 加速: 预裁剪 ROI 缓存
 CROP_CACHE_DIR="${CROP_CACHE_DIR:-data_drilling/roi_cache}"
@@ -17,8 +17,8 @@ CROP_CACHE_DIR="${CROP_CACHE_DIR:-data_drilling/roi_cache}"
 # ---- DINOv3 ----
 DINOV3_MODEL="${DINOV3_MODEL:-vit_small}"
 DINOV3_FEAT_DIM="${DINOV3_FEAT_DIM:-384}"
-DINOV3_ROI_SIZE="${DINOV3_ROI_SIZE:-224}"
-DINOV3_CHUNK_SIZE="${DINOV3_CHUNK_SIZE:-32}"
+DINOV3_ROI_SIZE="${DINOV3_ROI_SIZE:-128}"
+DINOV3_CHUNK_SIZE="${DINOV3_CHUNK_SIZE:-256}"
 
 # ---- 模型 ----
 D_MODEL="${D_MODEL:-128}"
@@ -29,7 +29,7 @@ FREEZE_ENCODER="${FREEZE_ENCODER:-True}"
 MASK_RATIO="${MASK_RATIO:-0.75}"
 
 # ---- 训练 ----
-BATCH_SIZE="${BATCH_SIZE:-2}"   # 每个样本独立处理，无需 batching
+BATCH_SIZE="${BATCH_SIZE:-2}" 
 EPOCHS="${EPOCHS:-100}"
 LR="${LR:-1e-4}"                # MAE decoder lr
 PATIENCE="${PATIENCE:-8}"
@@ -56,6 +56,9 @@ MAE_DECODER_DIM="${MAE_DECODER_DIM:-256}"
 MAE_DECODER_DEPTH="${MAE_DECODER_DEPTH:-4}"
 MAE_DECODER_HEADS="${MAE_DECODER_HEADS:-8}"
 
+# ---- 多卡 ----
+DEVICE_IDS="${DEVICE_IDS:-0 1}"
+
 ARGS=(
   --samples_info "$SAMPLES_INFO"
   --val_samples_info "$VAL_SAMPLES_INFO"
@@ -80,6 +83,7 @@ ARGS=(
   --stage1_scheduler "$STAGE1_SCHEDULER"
   --seed 42
   --save "$SAVE"
+  --device_ids $DEVICE_IDS
 )
 
 if [[ -n "$CROP_CACHE_DIR" && -d "$CROP_CACHE_DIR" ]]; then
@@ -110,6 +114,7 @@ echo "batch_size     : $BATCH_SIZE"
 echo "max_samples    : ${MAX_SAMPLES:-(all)}"
 echo "crop_cache_dir : $CROP_CACHE_DIR"
 echo "scheduler     : $STAGE1_SCHEDULER"
+echo "device_ids    : $DEVICE_IDS"
 echo "save          : $SAVE"
 echo "=============================================="
 cd "$REPO_ROOT"

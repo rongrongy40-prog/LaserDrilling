@@ -100,6 +100,16 @@ def _extract_single(
     return feats
 
 
+def _safe_filename(name: str) -> str:
+    """Sanitize a string to be safe as a filename."""
+    return name.replace(os.sep, "__").replace("/", "__").replace(".", "_")
+
+
+def _key_for_sample(sample_path: str) -> str:
+    """Generate the feature cache key for a sample path (must match extract.py)."""
+    return _safe_filename(sample_path) + ".pt"
+
+
 def extract_features(
     samples_info: str,
     out_dir: str,
@@ -112,6 +122,7 @@ def extract_features(
     device: torch.device,
     checkpoint_path: str | None,
     crop_cache_dir: str | None = None,
+    device_ids: list | None = None,
 ):
     if crop_cache_dir:
         print(f"[extract] Using CropCacheDataset (cache={crop_cache_dir})")
@@ -127,17 +138,38 @@ def extract_features(
             roi_size=dinov3_roi_size,
         )
 
-    # batch_size=1 means 1 sample per DataLoader step, but each sample has ~1400 frames.
-    # The _extract_single function flattens the full (1, T, F) per sample and processes
-    # it in dinov3_chunk_size chunks. This is already optimized per-sample.
-    # Increase batch_size if you have more GPU memory to further amortize overhead.
+    # Before creating DataLoader, filter out already-cached samples.
+    # This avoids loading data and running GPU forward for samples that are
+    # already extracted, which is the main source of wasted time.
+    os.makedirs(out_dir, exist_ok=True)
+    existing = set()
+    if os.path.isdir(out_dir):
+        for f in os.listdir(out_dir):
+            if f.endswith(".pt"):
+                existing.add(f)
+
+    # Filter dataset samples to only those not yet extracted.
+    # This mirrors the key generation logic in extract.py (no slash/sep fix).
+    if hasattr(dataset, "samples"):
+        before = len(dataset.samples)
+        dataset.samples = [
+            s for s in dataset.samples
+            if _key_for_sample(s["sample_path"]) not in existing
+        ]
+        after = len(dataset.samples)
+        print(f"[extract] Filtered: {before} total -> {after} to extract "
+              f"({before - after} already cached, skipping)")
+
+    # Rebuild the key set for samples we actually need to extract.
+    remaining = {_key_for_sample(s["sample_path"]) for s in dataset.samples}
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_masked_batch,
-        pin_memory=device.type == "cuda",
+        pin_memory=False,
     )
 
     extractor, is_model = build_feature_extractor(
@@ -147,61 +179,35 @@ def extract_features(
         dinov3_feat_dim=dinov3_feat_dim,
     )
     extractor = extractor.to(device)
+    print(f"[extract] Using device: {device}")
     extractor.eval()
 
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Build set of already-extracted files for fast skip
-    existing = set()
-    if os.path.isdir(out_dir):
-        for f in os.listdir(out_dir):
-            if f.endswith(".pt"):
-                existing.add(f)
-
     done = 0
-    skipped = 0
 
-    # torch.compile + multi-step forward loop causes CUDA Graphs tensor-overwrite issues
-    # with this codebase's DinoV3 forward. The chunk_size optimization already gives
-    # the main speedup, so compile is disabled for safety.
-    use_compile = False
-    if use_compile:
-        print("[extract] Applying torch.compile to DinoV3FeatureExtractor...")
-        extractor = torch.compile(extractor, mode="reduce-overhead")
-
+    loader_iter = iter(loader)
     with torch.inference_mode():
-        for batch_idx, batch in enumerate(tqdm(loader, desc="提取特征")):
-            frame_data = batch["frame_data"].to(device)   # (B, T, F, 3, H, W)
+        for batch_idx in tqdm(range(len(loader)), desc="提取特征"):
+            batch = next(loader_iter)
+            frame_data = batch["frame_data"].to(device, non_blocking=True)
             sample_paths = batch["sample_paths"]
 
-            # Warmup compile on first batch (only used when compile is enabled)
-            if use_compile and batch_idx == 0:
-                _ = _extract_single(
-                    extractor, is_model, frame_data[:1],
-                    dinov3_roi_size, dinov3_chunk_size,
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-
             feats = _extract_single(
-                extractor, is_model, frame_data,
-                dinov3_roi_size, dinov3_chunk_size,
+                extractor, is_model,
+                frame_data, dinov3_roi_size, dinov3_chunk_size,
             )
             feats = feats.cpu()
 
             for bi, sp in enumerate(sample_paths):
-                key = sp.replace(os.sep, "__").replace("/", "__").replace(".", "_") + ".pt"
-                if key in existing:
-                    skipped += 1
-                    continue
-                torch.save(
-                    {"features": feats[bi].float(), "sample_path": sp},
-                    os.path.join(out_dir, key),
-                )
-                existing.add(key)
-                done += 1
+                key = _key_for_sample(sp)
+                if key in remaining:
+                    torch.save(
+                        {"features": feats[bi].float(), "sample_path": sp},
+                        os.path.join(out_dir, key),
+                    )
+                    remaining.discard(key)
+                    done += 1
 
-    print(f"完成: {done} 个样本 (跳过 {skipped} 个已有文件)")
+    print(f"完成: {done} 个样本")
 
 
 def main():
@@ -228,9 +234,15 @@ def main():
                         help="Directory with pre-cropped ROI .pt files (from pre_crop.py). "
                              "If set, reads from CropCacheDataset instead of MaskedDrillingDataset. "
                              "Much faster when ROI crops are already cached.")
+    parser.add_argument("--device_ids", type=int, nargs="+", default=None,
+                        help="GPU device IDs to use, e.g. --device_ids 0 1. "
+                             "Defaults to all available GPUs.")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device_ids is not None:
+        device = torch.device(f"cuda:{args.device_ids[0]}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     extract_features(
         samples_info=args.samples_info,
         out_dir=args.output_dir,
@@ -243,6 +255,7 @@ def main():
         device=device,
         checkpoint_path=args.checkpoint,
         crop_cache_dir=args.crop_cache_dir,
+        device_ids=args.device_ids,
     )
 
 

@@ -53,7 +53,7 @@ fi
 # ---- 路径 ----
 CHECKPOINT="${CHECKPOINT:-grid_diff_tcn/masked_v2/checkpoints/stage2.pt}"
 ROI_CACHE_DIR="${ROI_CACHE_DIR:-data_drilling/roi_cache}"
-PRECOMPUTED_DIR="${PRECOMPUTED_DIR:-}"
+PRECOMPUTED_DIR="${PRECOMPUTED_DIR:-grid_diff_tcn/masked_v2/features_cache}"
 
 # ---- DINOv3 ----
 DINOV3_MODEL="${DINOV3_MODEL:-vit_small}"
@@ -77,7 +77,7 @@ LOCK_LAYERS="${LOCK_LAYERS:-30}"
 PRELOAD="${PRELOAD:-0}"
 
 # ---- 调试 ----
-MAX_SAMPLES="${MAX_SAMPLES:-20}"
+MAX_SAMPLES="${MAX_SAMPLES:-100}"
 
 # ---- S3WD / 决策参数 ----
 S3WD_WAIT="${S3WD_WAIT:-3}"

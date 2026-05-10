@@ -35,7 +35,7 @@ from torch.utils.data import DataLoader, Dataset
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 from grid_diff_tcn.masked_v2.model import MaskedPixelModel, load_masked_model
-from grid_diff_tcn.masked_v2.dataset import MaskedDrillingDataset, collate_masked_batch
+from grid_diff_tcn.masked_v2.dataset import MaskedDrillingDataset, CropCacheDataset, collate_masked_batch
 
 
 # ---------------------------------------------------------------------------
@@ -217,48 +217,38 @@ class ROICacheDataset(Dataset):
 def s3wd_decision(
     prob_t: torch.Tensor,
     mask_t: torch.Tensor,
-    pen_layer: int,
-    layers: List[int],
-    wait: int,
-    threshold: float,
+    layers: list[int],
+    wait: int = 3,
+    threshold: float = 0.6,
     accept: float = 1.0,
-    lock_layers: int = 30,
 ) -> int:
     """
-    S3WD decision — mirrors train.py s3wd_decision exactly.
+    S3WD decision for a single sample.
 
     逻辑：
     1. 从前往后扫，找第一个连续 `wait` 帧 prob >= threshold 的位置 ti
-       - 如果某帧 prob >= accept，跳过 wait 延迟，立即决策
+       - 如果某帧 prob >= accept，跳过 wait 延迟，立即决策（穿透）
     2. 将 ti 映射回物理层 ID: pred_layer = layers[ti]
-    3. 如果找不到，fallback 到 argmax（返回 layers[argmax]）
+    3. 如果找不到，fallback 到 argmax
 
     Args:
         prob_t: (T,) class-1 probability
         mask_t: (T,) bool frame valid mask
-        pen_layer: physical layer ID (only used for lock_layers check here)
         layers: physical layer IDs, len == T
         wait: number of consecutive frames above threshold to confirm
         threshold: probability threshold
         accept: if prob >= accept, decision is made immediately (skip wait). Default 1.0 (disabled).
-        lock_layers: layers before this index are forced to non-penetrated
 
     Returns:
-        pred_layer: physical layer ID, or -1 if not penetrated / invalid
+        pred_layer: physical layer ID, or -1 if invalid
     """
-    if pen_layer < 0 or pen_layer not in layers:
-        return -1
-    pen_idx = layers.index(pen_layer)
-    if pen_idx < lock_layers:
-        return -1
-
     t = len(prob_t)
     consecutive_high = 0
 
     for ti in range(t):
         if not mask_t[ti]:
             continue
-        p = float(prob_t[ti])
+        p = prob_t[ti].item()
         if p >= accept:
             return layers[ti] if ti < len(layers) else layers[-1]
         if p >= threshold:
@@ -276,6 +266,43 @@ def s3wd_decision(
     valid_prob[~valid] = float("-inf")
     argmax_ti = valid_prob.argmax().item()
     return layers[argmax_ti] if argmax_ti < len(layers) else layers[-1]
+
+
+def _s3wd_fixed_eval(
+    all_frame_probs: list,
+    all_labels: list,
+    all_pen_layers: list,
+    all_layer_lists: list,
+    lock_layers: int,
+    wait: int = 3,
+    threshold: float = 0.6,
+    accept: float = 1.0,
+) -> tuple[float, dict]:
+    """Fixed-parameter S3WD evaluation. Returns (combined_metric, params_dict)."""
+    preds = []
+    for (prob_t, mask_t), label, pen_layer, layers in zip(
+            all_frame_probs, all_labels, all_pen_layers, all_layer_lists):
+        if label != 1:
+            preds.append(-1)
+            continue
+        if pen_layer < 0 or pen_layer not in layers:
+            preds.append(-1)
+            continue
+        pen_idx = layers.index(pen_layer)
+        if pen_idx < lock_layers:
+            preds.append(-1)
+            continue
+        pred_layer = s3wd_decision(prob_t, mask_t, layers, wait=wait, threshold=threshold, accept=accept)
+        preds.append(pred_layer)
+    m = compute_metrics(preds, all_labels, all_pen_layers, all_layer_lists, lock_layers=lock_layers)
+    combined = m["pct_within_3"] + m["pct_within_5"]
+    return combined, {
+        "wait": wait, "threshold": threshold, "accept": accept,
+        "pct_within_3": m["pct_within_3"],
+        "pct_within_5": m["pct_within_5"],
+        "pct_over_10": m["pct_over_10"],
+        "total": m["total"],
+    }
 
 
 def compute_metrics(
@@ -445,27 +472,25 @@ def run_inference(
     best_s3wd_params: Optional[dict] = None,
 ) -> tuple[List[dict], dict]:
     """
-    Run inference on a dataset.
+    Batch inference — mirrors evaluate_stage2 exactly.
 
-    If decision_method == "s3wd" and best_s3wd_params is provided,
-    those params override s3wd_wait / s3wd_thresh / s3wd_accept.
-
-    If decision_method == "learned", the TemporalDecisionHead is used directly
-    — first prob > 0.5 determines the prediction, same logic as training.
-    No threshold tuning needed.
+    decision_method:
+      - "s3wd": argmax on softmax probability + S3WD post-processing
+      - "learned": TemporalDecisionHead — first decision_prob > 0.5 determines prediction
 
     Returns:
-        csv_rows: list of dicts with hole_path, true_layer, pred_layer, error
+        csv_rows: list of dicts
         metrics: dict with aggregate metrics
     """
     model.eval()
+    use_learned = (decision_method == "learned")
 
+    all_preds: List[int] = []
     all_labels: List[int] = []
     all_pen_layers: List[int] = []
     all_layer_lists: List[List[int]] = []
     all_sample_paths: List[str] = []
-    all_frame_probs: List[tuple] = []
-    all_decision_probs: List[torch.Tensor] = []  # (T,) per sample, for learned decision
+    all_frame_probs: List[tuple] = []  # only used by s3wd
 
     with torch.inference_mode():
         for batch in tqdm(loader, desc="[Inference] Running model"):
@@ -478,139 +503,93 @@ def run_inference(
 
             result = model.forward(
                 frame_data, frame_mask=frame_mask,
-                return_decision_idx=(decision_method == "learned"),
+                return_decision_idx=use_learned,
             )
             logits = result["logits"]
 
+            # ---- lock_layers: mask out early layers for class 1 ----
+            logits_locked = logits.clone()
             if lock_layers > 0:
-                logits_locked = logits.clone()
                 logits_locked[:, 1, :lock_layers] = float("-inf")
+
+            # ---- Prediction ----
+            if use_learned:
+                decision_idx = result.get("decision_idx")
+                for bi in range(logits.shape[0]):
+                    if decision_idx is not None and labels[bi].item() == 1:
+                        ll = layer_lists_batch[bi]
+                        raw = int(round(decision_idx[bi].item()))
+                        idx = max(0, min(raw, len(ll) - 1))
+                        all_preds.append(ll[idx])
+                    else:
+                        all_preds.append(-1)
             else:
-                logits_locked = logits
+                probs = F.softmax(logits_locked, dim=1)[:, 1]  # (B, T)
+                for bi, ll in enumerate(layer_lists_batch):
+                    pt = probs[bi]
+                    mask_t = frame_mask[bi].any(dim=1)
+                    all_frame_probs.append((pt.cpu(), mask_t.cpu()))
+                    if mask_t.sum() == 0:
+                        all_preds.append(-1)
+                        continue
+                    valid = pt[mask_t]
+                    valid_idx = torch.where(mask_t)[0]
+                    argmax_ti = valid_idx[valid.argmax()].item()
+                    all_preds.append(ll[argmax_ti] if argmax_ti < len(ll) else ll[-1])
 
-            probs = F.softmax(logits_locked, dim=1)[:, 1]  # (B, T)
+            all_labels.extend(labels.cpu().tolist())
+            all_pen_layers.extend(pen_layers.cpu().tolist())
+            all_layer_lists.extend(layer_lists_batch)
+            all_sample_paths.extend(sample_paths_batch)
 
-            # Collect learned decision probs if available
-            decision_probs_batch = None
-            if decision_method == "learned":
-                decision_probs_batch = result.get("decision_probs")
-                if decision_probs_batch is not None:
-                    decision_probs_batch = decision_probs_batch.cpu()
+    # ---- Metrics ----
+    metrics = compute_metrics(
+        all_preds, all_labels, all_pen_layers, all_layer_lists,
+        lock_layers=lock_layers, debug=False,
+    )
 
-            for bi in range(logits.shape[0]):
-                prob_t = probs[bi].cpu()
-                mask_bi = frame_mask[bi]
-                mask_t = mask_bi.any(dim=1)
-                all_frame_probs.append((prob_t, mask_t))
-                all_labels.append(int(labels[bi].item()))
-                all_pen_layers.append(int(pen_layers[bi].item()))
-                all_layer_lists.append(layer_lists_batch[bi])
-                all_sample_paths.append(sample_paths_batch[bi])
-                if decision_probs_batch is not None:
-                    all_decision_probs.append(decision_probs_batch[bi])
-                else:
-                    all_decision_probs.append(prob_t)  # fallback: use raw probs
-
-    # Decide effective params
-    if decision_method == "s3wd" and best_s3wd_params:
-        eff_wait = best_s3wd_params.get("wait", s3wd_wait)
-        eff_thresh = best_s3wd_params.get("threshold", s3wd_threshold)
-        eff_accept = best_s3wd_params.get("accept", s3wd_accept)
+    if use_learned:
+        metrics["best_s3wd_metric"] = metrics["pct_within_5"]
+        metrics["best_s3wd_params"] = {
+            "mode": "learned_decision",
+            "pct_within_3": metrics["pct_within_3"],
+            "pct_within_5": metrics["pct_within_5"],
+            "pct_over_10": metrics["pct_over_10"],
+            "total": metrics["total"],
+        }
+        metrics["learned_decision"] = True
     else:
         eff_wait = s3wd_wait
         eff_thresh = s3wd_threshold
         eff_accept = s3wd_accept
+        if best_s3wd_params:
+            eff_wait = best_s3wd_params.get("wait", eff_wait)
+            eff_thresh = best_s3wd_params.get("threshold", eff_thresh)
+            eff_accept = best_s3wd_params.get("accept", eff_accept)
+        best_metric, best_params = _s3wd_fixed_eval(
+            all_frame_probs, all_labels, all_pen_layers, all_layer_lists, lock_layers,
+            wait=eff_wait, threshold=eff_thresh, accept=eff_accept,
+        )
+        metrics["best_s3wd_metric"] = best_metric
+        metrics["best_s3wd_params"] = best_params
+        metrics["learned_decision"] = False
 
-    preds = []
-    for si, ((prob_t, mask_t), label, pen_layer, layers, dec_probs_t) in enumerate(zip(
-            all_frame_probs, all_labels, all_pen_layers, all_layer_lists, all_decision_probs)):
-        if decision_method == "learned":
-            # TemporalDecisionHead: 找第一个 prob > 0.5 的位置
-            # lock_layers 安全锁：如果真实穿透层在 lock_layers 之前，预测 -1
-            if label == 1 and pen_layer in layers:
-                pen_idx = layers.index(pen_layer)
-                if pen_idx >= lock_layers:
-                    first_above = -1
-                    for ti in range(len(dec_probs_t)):
-                        if mask_t[ti] and dec_probs_t[ti] > 0.5:
-                            first_above = ti
-                            break
-                    if first_above >= 0:
-                        pred_layer = layers[first_above]
-                    else:
-                        # Fallback: argmax
-                        valid_probs = dec_probs_t.clone()
-                        valid_probs[~mask_t] = float("-inf")
-                        fallback_ti = valid_probs.argmax().item()
-                        pred_layer = layers[fallback_ti] if fallback_ti < len(layers) else layers[-1]
-                else:
-                    pred_layer = -1
-            else:
-                pred_layer = -1
-        elif decision_method == "s3wd":
-            pred_layer = s3wd_decision(
-                prob_t, mask_t, pen_layer, layers,
-                wait=eff_wait, thresh=eff_thresh, accept=eff_accept, lock_layers=lock_layers,
-            )
-        elif decision_method == "topkmedian":
-            valid_probs = prob_t[mask_t]
-            valid_idx = torch.where(mask_t)[0]
-            if valid_probs.numel() == 0:
-                pred_layer = -1
-            else:
-                k_actual = min(9, valid_probs.numel())
-                topk_probs, topk_indices = valid_probs.topk(k_actual)
-                if topk_probs.median() >= eff_thresh:
-                    pred_layer = valid_idx[topk_indices[topk_indices == topk_probs.argmax()]].item()
-                else:
-                    pred_layer = -1
-        else:  # "threshold" — argmax
-            valid_probs = prob_t[mask_t]
-            valid_idx = torch.where(mask_t)[0]
-            if valid_probs.numel() == 0:
-                pred_layer = -1
-            else:
-                max_idx = valid_probs.argmax()
-                pred_layer = valid_idx[max_idx].item()
-                if valid_probs.max() < eff_thresh:
-                    pred_layer = -1
-        preds.append(pred_layer)
-
-    # Build CSV rows
+    # ---- Build CSV rows ----
     csv_rows = []
-    for sp, true_layer, pred_layer, layers, dec_probs_t in zip(
-            all_sample_paths, all_pen_layers, preds, all_layer_lists, all_decision_probs):
+    for sp, true_layer, pred_layer, layers in zip(
+            all_sample_paths, all_pen_layers, all_preds, all_layer_lists):
         if true_layer >= 0 and pred_layer >= 0 and pred_layer in layers:
             true_idx = layers.index(true_layer)
             pred_idx = layers.index(pred_layer)
             error = abs(pred_idx - true_idx)
         else:
             error = -1
-        # Compute raw decision idx for logging: first prob > 0.5
-        raw_idx = -1.0
-        if isinstance(dec_probs_t, torch.Tensor):
-            for ti in range(len(dec_probs_t)):
-                if dec_probs_t[ti] > 0.5:
-                    raw_idx = float(ti)
-                    break
-            if raw_idx < 0:
-                raw_idx = float(dec_probs_t.argmax().item())
         csv_rows.append({
             "hole_path": sp,
             "true_layer": true_layer,
             "pred_layer": pred_layer,
             "error": error,
-            "raw_decision_idx": round(raw_idx, 3),
         })
-
-    # Compute aggregate metrics
-    metrics = compute_metrics(
-        preds, all_labels, all_pen_layers, all_layer_lists,
-        lock_layers=lock_layers,
-    )
-    metrics["decision_method"] = decision_method
-    if decision_method == "s3wd":
-        metrics["s3wd_params"] = {"wait": eff_wait, "threshold": eff_thresh, "accept": eff_accept}
 
     return csv_rows, metrics
 
@@ -702,9 +681,6 @@ def run_streaming_inference(
     """
     model.eval()
 
-    # Get feature extractor for cached feature mode
-    has_features = hasattr(model, "get_features")
-
     all_labels: List[int] = []
     all_pen_layers: List[int] = []
     all_layer_lists: List[List[int]] = []
@@ -738,15 +714,16 @@ def run_streaming_inference(
             # If model uses cached features (pre-extracted), extract now
             # Otherwise model.forward will handle it internally
             features: torch.Tensor | None = None
-            if has_features and model.use_cached_features:
-                # frame_data is (T, F, C) cached features
-                features = frame_data.unsqueeze(0).to(device)     # (1, T, F, C)
-            elif has_features and isinstance(frame_data, torch.Tensor) and frame_data.dim() == 3:
-                # frame_data is (T, F, C) already features
-                features = frame_data.unsqueeze(0).to(device)
-            else:
-                # frame_data is (T, F, 3, H, W) raw images → forward handles internally
-                features = None
+            if model.use_cached_features:
+                # CropCacheDataset returns frame_data in (T, F, C) format when
+                # precomputed features are available. This is already the extracted
+                # feature tensor — no need to call dinov3_extractor.
+                if frame_data.dim() == 3:
+                    features = frame_data.unsqueeze(0).to(device)          # (1, T, F, C)
+                elif frame_data.dim() == 4:
+                    # 5D squeezed to 4D → raw images (shouldn't happen with CropCacheDataset)
+                    features = frame_data.unsqueeze(0)                     # (1, T, F, 3, H, W)
+                # else: keep features = None
 
             # Reset classifier streaming state
             model.classifier.reset_hidden()
@@ -766,21 +743,17 @@ def run_streaming_inference(
             for ti in range(max_steps):
                 # Extract feature for this layer
                 if features is not None:
-                    # features: (1, T, F, C) — cached features
+                    # features: (1, T, F, C) — cached features (or pre-extracted)
                     feat_t = features[:, ti:ti+1, :, :]          # (1, 1, F, C)
-                    mask_t = frame_mask[ti:ti+1].unsqueeze(0)    # (1, 1, F)
+                    mask_t = frame_mask[ti:ti+1, None, :]       # (1, 1, F)
                 else:
-                    # frame_data: (T, F, 3, H, W) raw images
-                    img_t = frame_data[ti:ti+1].unsqueeze(0)     # (1, 1, F, 3, H, W)
-                    mask_t = frame_mask[ti:ti+1].unsqueeze(0)    # (1, 1, F)
-                    # Extract DINOv3 features for this single layer's frames
-                    img_flat = img_t.reshape(-1, *img_t.shape[-3:])  # (1*1*F, 3, H, W)
-                    feat_list = []
-                    for start in range(0, img_flat.shape[0], model.dinov3_chunk_size):
-                        end = min(start + model.dinov3_chunk_size, img_flat.shape[0])
-                        feat_list.append(model.dinov3_extractor(img_flat[start:end].to(device)))
-                    feat_t = torch.cat(feat_list, dim=0)        # (1*1*F, C)
-                    feat_t = feat_t.reshape(*img_t.shape[:3], -1)  # (1, 1, F, C)
+                    # Raw images without precomputed features are not supported
+                    # in streaming mode — use batch inference (--streaming 0) instead
+                    raise RuntimeError(
+                        "Streaming inference requires pre-extracted features. "
+                        "Set --use_cached_features and --precomputed_dir, or use "
+                        "batch inference (streaming=0)."
+                    )
 
                 feat_t_dev = feat_t.to(device)
                 mask_t_dev = mask_t.to(device)
@@ -925,7 +898,7 @@ def print_metrics(metrics: dict, prefix: str = "[Inference]"):
         print(f"  pct_within_5: {metrics['pct_within_5']*100:.1f}%")
         print(f"  pct_over_10:  {metrics['pct_over_10']*100:.1f}%")
         if dm == "s3wd":
-            p = metrics.get("s3wd_params", {})
+            p = metrics.get("best_s3wd_params", {})
             print(f"  (S3WD params: wait={p.get('wait','?')}, "
                   f"thresh={p.get('threshold','?')}, accept={p.get('accept','?')})")
         elif dm == "learned":
@@ -961,15 +934,28 @@ def build_dataset(
     num_workers = args.num_workers
 
     if mode == "cache":
-        dataset = ROICacheDataset(
-            cache_dir=args.roi_cache_dir,
-            samples_info_path=samples_info_path,
-            roi_size=roi_size,
-            max_layers=max_layers,
-            max_frames_per_layer=max_frames,
-            preload=preload,
-            max_samples=max_samples,
-        )
+        if getattr(args, "use_cached_features", False) and getattr(args, "precomputed_dir", None):
+            # CropCacheDataset supports both ROI cache and precomputed features
+            dataset = CropCacheDataset(
+                cache_dir=args.roi_cache_dir,
+                samples_info_path=samples_info_path,
+                roi_size=roi_size,
+                max_layers=max_layers,
+                max_frames_per_layer=max_frames,
+                preload=preload,
+                max_samples=max_samples,
+                precomputed_dir=args.precomputed_dir,
+            )
+        else:
+            dataset = ROICacheDataset(
+                cache_dir=args.roi_cache_dir,
+                samples_info_path=samples_info_path,
+                roi_size=roi_size,
+                max_layers=max_layers,
+                max_frames_per_layer=max_frames,
+                preload=preload,
+                max_samples=max_samples,
+            )
     else:
         dataset = MaskedDrillingDataset(
             samples_info_path=samples_info_path,
@@ -1255,6 +1241,13 @@ def main():
         eff_s3wd_params = None
 
     if args.streaming:
+        if not model.use_cached_features:
+            raise RuntimeError(
+                "Streaming inference (STREAMING=1) requires pre-extracted features. "
+                "Set PRECOMPUTED_DIR and USE_CACHED_FEATURES=1 (or pass --use_cached_features "
+                "and --precomputed_dir), then re-run feature extraction with "
+                "PRECOMPUTED_DIR=<dir> bash grid_diff_tcn/masked_v2/scripts/extract_features.sh"
+            )
         print(f"[Phase 2] STREAMING mode — early stopping enabled")
         print(f"  stop_thresh={args.stop_thresh}, stop_wait={args.stop_wait}, "
               f"stop_accept={args.stop_accept}, max_layers={args.max_inference_layers}")
@@ -1278,10 +1271,9 @@ def main():
             s3wd_accept=eff_s3wd_params["accept"] if eff_s3wd_params else args.s3wd_accept,
             lock_layers=args.lock_layers,
             best_s3wd_params=eff_s3wd_params,
-            # use_learned_decision=args.decision_method == "learned",
         )
-        csv_fieldnames = ["hole_path", "true_layer", "pred_layer", "error", "raw_decision_idx"]
-    test_metrics["decision_method"] = eff_method + ("_streaming" if args.streaming else "")
+        csv_fieldnames = ["hole_path", "true_layer", "pred_layer", "error"]
+    test_metrics["decision_method"] = eff_method
 
     print_metrics(test_metrics, prefix="[Phase 2 Test]")
 

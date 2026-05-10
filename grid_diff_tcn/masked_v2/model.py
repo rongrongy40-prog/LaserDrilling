@@ -348,6 +348,7 @@ def load_masked_model(
     stage: int = 2,
     unfreeze_encoder: bool = False,
     finetune_classifier: bool = True,
+    encoder_checkpoint: str | None = None,
     **kwargs,
 ) -> MaskedPixelModel:
     """
@@ -358,81 +359,102 @@ def load_masked_model(
     - If finetune_classifier=True: try to load classifier weights from Stage 1 checkpoint
     - If finetune_classifier=False: classifier is initialized from scratch
 
+    Also supports loading encoder and classifier from separate checkpoints:
+    - encoder_checkpoint: path to Stage 1 checkpoint (provides backbone + mae_pretrainer weights)
+    - checkpoint_path: path to Stage 2 checkpoint (provides classifier weights)
+
     Args:
-        checkpoint_path: path to checkpoint
+        checkpoint_path: path to Stage 2 checkpoint (classifier weights)
         stage: 1 or 2
         unfreeze_encoder: if True, unfreeze encoder after loading
         finetune_classifier: if True, try to load classifier weights
+        encoder_checkpoint: optional path to Stage 1 checkpoint for encoder weights
         **kwargs: passed to MaskedPixelModel __init__
 
     Returns:
         model: loaded model
     """
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    config = {}
+    sd_classifier = {}
+    import os
+    # Load classifier checkpoint (stage 2)
+    if os.path.exists(checkpoint_path):
+        ckpt_clf = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        config.update(ckpt_clf.get("config", {}))
+        sd_classifier = ckpt_clf.get("state_dict", ckpt_clf)
+        sd_classifier = {k.replace("module.", ""): v for k, v in sd_classifier.items()}
+    else:
+        print(f"  [load] WARNING: classifier checkpoint not found: {checkpoint_path}")
 
-    config = checkpoint.get("config", {})
+    # Load encoder checkpoint (stage 1) if provided
+    sd_encoder = {}
+    if encoder_checkpoint and os.path.exists(encoder_checkpoint):
+        ckpt_enc = torch.load(encoder_checkpoint, map_location="cpu", weights_only=True)
+        # Merge encoder config (but classifier config takes priority)
+        enc_config = ckpt_enc.get("config", {})
+        for k, v in enc_config.items():
+            if k not in config:
+                config[k] = v
+        sd_encoder = ckpt_enc.get("state_dict", ckpt_enc)
+        sd_encoder = {k.replace("module.", ""): v for k, v in sd_encoder.items()}
+        print(f"  [load] Loaded encoder from: {encoder_checkpoint}")
+    elif checkpoint_path and os.path.exists(checkpoint_path):
+        # Fallback: try loading encoder from the same checkpoint
+        sd_encoder = sd_classifier
+
     config.update(kwargs)
     config["stage"] = int(stage)
 
     model = MaskedPixelModel(**config)
 
-    sd = checkpoint.get("state_dict", checkpoint)
-    pretrained_sd = {k.replace("module.", ""): v for k, v in sd.items()}
-    loaded_keys = set()
+    model_sd = model.state_dict()
+    matched = {}
 
-    if int(stage) == 2:
-        matched = {}
-        model_sd = model.state_dict()
+    # ---- Load encoder weights from encoder checkpoint (stage 1) ----
+    # 1. MAE decoder weights
+    for k in sd_encoder:
+        if k.startswith("mae_pretrainer."):
+            if k in model_sd and model_sd[k].shape == sd_encoder[k].shape:
+                matched[k] = sd_encoder[k]
 
-        # 1. MAE decoder weights: mae_pretrainer.decoder.xxx → mae_pretrainer.decoder.xxx
-        for k in pretrained_sd:
-            if k.startswith("mae_pretrainer."):
-                if k in model_sd:
-                    if model_sd[k].shape == pretrained_sd[k].shape:
-                        matched[k] = pretrained_sd[k]
-                        loaded_keys.add(k)
+    # 2. Encoder backbone
+    for k in sd_encoder:
+        if k.startswith("dinov3_extractor.backbone."):
+            if k in model_sd and model_sd[k].shape == sd_encoder[k].shape:
+                matched[k] = sd_encoder[k]
 
-        # 2. Encoder backbone: dinov3_extractor.backbone.xxx → dinov3_extractor.backbone.xxx
-        for k in pretrained_sd:
-            if k.startswith("dinov3_extractor.backbone."):
-                if k in model_sd:
-                    if model_sd[k].shape == pretrained_sd[k].shape:
-                        matched[k] = pretrained_sd[k]
-                        loaded_keys.add(k)
-
-        mismatched = model.load_state_dict(matched, strict=False)
-        for k in mismatched.missing_keys:
-            print(f"  [load] missing key (not in checkpoint): {k}")
-        for k in mismatched.unexpected_keys:
+    mismatched = model.load_state_dict(matched, strict=False)
+    for k in mismatched.missing_keys:
+        print(f"  [load] missing key (not in checkpoint): {k}")
+    for k in mismatched.unexpected_keys:
+        if "classifier" not in k:
             print(f"  [load] unexpected key (not in model): {k}")
 
-        print(f"  [load] Stage1→Stage2: loaded {len(matched)} keys "
-              f"(encoder={sum(1 for k in matched if 'backbone' in k)}, "
-              f"mae_decoder={sum(1 for k in matched if 'mae_pretrainer.decoder' in k)})")
+    print(f"  [load] Stage1→Stage2: loaded {len(matched)} keys "
+          f"(encoder={sum(1 for k in matched if 'backbone' in k)}, "
+          f"mae_decoder={sum(1 for k in matched if 'mae_pretrainer.decoder' in k)})")
 
-        # Try to load classifier weights
-        if finetune_classifier:
-            classifier_matched = {}
-            for k in pretrained_sd:
-                if k.startswith("classifier."):
-                    if k in model_sd:
-                        if model_sd[k].shape == pretrained_sd[k].shape:
-                            classifier_matched[k] = pretrained_sd[k]
-                            loaded_keys.add(k)
-                        else:
-                            print(f"  [load] skip classifier.{k[11:]}: shape mismatch")
+    # ---- Load classifier weights from classifier checkpoint (stage 2) ----
+    if finetune_classifier and sd_classifier:
+        classifier_matched = {}
+        for k in sd_classifier:
+            if k.startswith("classifier."):
+                if k in model_sd:
+                    if model_sd[k].shape == sd_classifier[k].shape:
+                        classifier_matched[k] = sd_classifier[k]
+                    else:
+                        print(f"  [load] skip classifier.{k[11:]}: shape mismatch "
+                              f"({model_sd[k].shape} vs {sd_classifier[k].shape})")
 
-            if classifier_matched:
-                model.load_state_dict(classifier_matched, strict=False)
-                print(f"  [load] Stage1→Stage2: loaded {len(classifier_matched)} classifier keys")
-            else:
-                print(f"  [load] Stage1→Stage2: no compatible classifier keys, using initialized weights")
+        if classifier_matched:
+            model.load_state_dict(classifier_matched, strict=False)
+            print(f"  [load] Stage2: loaded {len(classifier_matched)} classifier keys")
+        else:
+            print(f"  [load] Stage2: no compatible classifier keys, using initialized weights")
 
-        if unfreeze_encoder and hasattr(model, "dinov3_extractor"):
-            for param in model.dinov3_extractor.parameters():
-                param.requires_grad = True
-            print("  [load] encoder unfrozen for fine-tuning")
-    else:
-        model.load_state_dict(sd, strict=False)
+    if unfreeze_encoder and hasattr(model, "dinov3_extractor"):
+        for param in model.dinov3_extractor.parameters():
+            param.requires_grad = True
+        print("  [load] encoder unfrozen for fine-tuning")
 
     return model

@@ -364,6 +364,14 @@ def collate_masked_batch(batch: list) -> dict:
 
     for bi, item in enumerate(batch):
         src_t, src_f = item["frame_data"].shape[:2]
+        item_mask_t, item_mask_f = item["frame_mask"].shape
+        if item_mask_t != src_t or item_mask_f != src_f:
+            raise RuntimeError(
+                f"[collate] shape mismatch at batch item {bi}: "
+                f"frame_data.shape[:2]={src_t},{src_f} but "
+                f"frame_mask.shape={item_mask_t},{item_mask_f} "
+                f"(sample_path={item.get('sample_path','?')})"
+            )
         frame_data[bi, :src_t, :src_f] = item["frame_data"]
         frame_mask[bi, :src_t, :src_f] = item["frame_mask"]
         seq_labels.append(item["seq_label"])
@@ -468,13 +476,14 @@ class CropCacheDataset(Dataset):
             safe = rel.replace(os.sep, "_").replace("/", "_")
             self._cache_map[sp] = os.path.join(self.cache_dir, f"{safe}.pt")
 
-        # 建立 sample_path -> precomputed_feature_path 映射（与 extract.py 一致）
+        # 建立 sample_path -> precomputed_feature_path 映射（与 extract.py _safe_filename 一致）
         self._feat_map: dict[str, str] = {}
         if self.precomputed_dir:
             for s in self.samples:
                 sp = s["sample_path"]
                 if not sp:
                     continue
+                # 与 extract.py _safe_filename() 完全一致
                 key = sp.replace(os.sep, "__").replace("/", "__").replace(".", "_")
                 self._feat_map[sp] = os.path.join(self.precomputed_dir, f"{key}.pt")
 
@@ -565,7 +574,6 @@ class CropCacheDataset(Dataset):
 
         if cached is None:
             # 缓存不存在，返回零张量（与 MaskedDrillingDataset 空样本格式一致）
-            # 形状: (T, F, 3, H, W) 其中 T=1, F=max_frames_per_layer
             frame_data = torch.zeros(
                 1, self.max_frames_per_layer, 3, self.roi_size, self.roi_size,
                 dtype=torch.float32
@@ -599,9 +607,21 @@ class CropCacheDataset(Dataset):
             if feat_cached is not None:
                 # 支持两种格式：extract.py 输出的 "features" 和 precompute.py 输出的 "frame_data"
                 if "features" in feat_cached:
+                    feat_t, feat_f = feat_cached["features"].shape[:2]
                     frame_data = feat_cached["features"]   # (T, F, feat_dim) from extract.py
                 else:
+                    feat_t, feat_f = feat_cached["frame_data"].shape[:2]
                     frame_data = feat_cached["frame_data"]  # (T, F, feat_dim) from precompute.py
+                # ROI 缓存的 mask 形状可能与 frame_data 不一致。
+                # 1. 转置修复：(F, T) -> (T, F)
+                raw_mask_t, raw_mask_f = raw_mask.shape
+                if (raw_mask_t, raw_mask_f) == (feat_f, feat_t):
+                    raw_mask = raw_mask.t()
+                    raw_mask_t, raw_mask_f = raw_mask.shape
+                # 2. T 截断：如果 ROI 缓存被 max_layers 截断（比 feat_t 小），
+                #    则预计算特征也截断到同样大小（保持一致）
+                if raw_mask_t < feat_t:
+                    frame_data = frame_data[:raw_mask_t]
             else:
                 frame_data = raw_frames  # already (T, F, 3, H, W)
             frame_mask = raw_mask

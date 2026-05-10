@@ -13,12 +13,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # ---- 数据 ----
-SAMPLES_INFO="${SAMPLES_INFO:-grid_diff_tcn/samples_info_train_split.json}"
-VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-grid_diff_tcn/samples_info_val.json}"
+SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_train_split.json}"
+VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val_split.json}"
 
 # 加速: 预裁剪 ROI 缓存 / 预计算特征
 CROP_CACHE_DIR="${CROP_CACHE_DIR:-data_drilling/roi_cache}"
-PRECOMPUTED_DIR="${PRECOMPUTED_DIR:-}"    # Stage1 encoder 提取的特征（可选，加速训练）
+PRECOMPUTED_DIR="${PRECOMPUTED_DIR:-grid_diff_tcn/masked_v2/features_cache}"    # Stage1 encoder 提取的特征（可选，加速训练）
 
 # ---- DINOv3 ----
 DINOV3_MODEL="${DINOV3_MODEL:-vit_small}"
@@ -36,7 +36,7 @@ MASK_RATIO="${MASK_RATIO:-0.75}"
 MASK_SHAPE="${MASK_SHAPE:-circle}"
 
 # ---- 训练 ----
-BATCH_SIZE="${BATCH_SIZE:-2}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 EPOCHS="${EPOCHS:-50}"
 LR="${LR:-1e-4}"                         # classifier lr (reduced from 1e-4)
 ENCODER_LR_STAGE2="${ENCODER_LR_STAGE2:-1e-4}"  # encoder lr（仅 unfreeze 时用）
@@ -44,7 +44,7 @@ UNFREEZE_ENCODER_STAGE2="${UNFREEZE_ENCODER_STAGE2:-False}"  # 默认冻结 enco
 PATIENCE="${PATIENCE:-10}"
 EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-10}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
-PRELOAD="${PRELOAD:-1}"
+PRELOAD="${PRELOAD:-0}"
 RESUME_FROM="${RESUME_FROM:-grid_diff_tcn/masked_v2/checkpoints/stage1.pt}"           # 必须指定 Stage1 checkpoint
 FINETUNE_CLASSIFIER="${FINETUNE_CLASSIFIER:-True}"  # 是否微调分类头权重
 ACCUM_STEPS_STAGE2="${ACCUM_STEPS_STAGE2:-4}"  # 梯度累积步数
@@ -72,6 +72,9 @@ WITHIN5_WEIGHT="${WITHIN5_WEIGHT:-0.2}"
 S3WD_WAIT="${S3WD_WAIT:-3}"
 S3WD_THRESHOLD="${S3WD_THRESHOLD:-0.6}"
 S3WD_ACCEPT="${S3WD_ACCEPT:-0.7}"
+
+# ---- 多卡 ----
+DEVICE_IDS="${DEVICE_IDS:-0}"
 
 if [[ -z "$RESUME_FROM" ]]; then
   echo "ERROR: 必须指定 Stage1 checkpoint 路径"
@@ -121,6 +124,7 @@ ARGS=(
   --s3wd_wait "$S3WD_WAIT"
   --s3wd_threshold "$S3WD_THRESHOLD"
   --s3wd_accept "$S3WD_ACCEPT"
+  --device_ids $DEVICE_IDS
 )
 
 if [[ "$USE_LEARNED_DECISION" == "True" ]]; then
@@ -170,6 +174,7 @@ echo "lock_layers   : $LOCK_LAYERS"
 echo "index_loss_w  : $INDEX_LOSS_WEIGHT"
 echo "within5_tol   : $WITHIN5_TOLERANCE"
 echo "precomputed   : ${PRECOMPUTED_DIR:-(none)}"
+echo "device_ids    : $DEVICE_IDS"
 echo "save          : $SAVE"
 echo "=============================================="
 cd "$REPO_ROOT"
