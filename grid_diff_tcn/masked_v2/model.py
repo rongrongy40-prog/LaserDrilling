@@ -427,7 +427,8 @@ def load_masked_model(
 
     mismatched = model.load_state_dict(matched, strict=False)
     for k in mismatched.missing_keys:
-        print(f"  [load] missing key (not in checkpoint): {k}")
+        if not k.startswith("classifier."):
+            print(f"  [load] missing key (not in checkpoint): {k}")
     for k in mismatched.unexpected_keys:
         if "classifier" not in k:
             print(f"  [load] unexpected key (not in model): {k}")

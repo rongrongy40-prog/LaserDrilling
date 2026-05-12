@@ -656,11 +656,13 @@ class HierarchicalGridDiffProbTransformer(nn.Module):
             None for _ in self.transformer_layers
         ]
         self._step_count = 0
+        self._lock_layers = 0
 
     def forward_step(
         self,
         x_step: torch.Tensor,
         frame_mask_step: torch.Tensor | None = None,
+        lock_layers: int = 0,
     ) -> dict:
         """
         Streaming forward: process one layer's frame features at a time.
@@ -680,9 +682,11 @@ class HierarchicalGridDiffProbTransformer(nn.Module):
               - decision_idx: (B,) — learned layer index (full sequence)
         """
         b = x_step.shape[0]
+        self._lock_layers = lock_layers
 
         if not hasattr(self, "_z_seq"):
             self.reset_hidden()
+            self._lock_layers = lock_layers
 
         # Frame-level feature for this layer — use streaming method if available,
         # otherwise fall back to regular forward (safe for statelss encoders)
@@ -718,6 +722,11 @@ class HierarchicalGridDiffProbTransformer(nn.Module):
              if self._step_count > 0 else torch.empty(b, 2, 0, device=z_acc.device, dtype=z_acc.dtype),
              logits_step], dim=2
         )
+
+        # ---- lock_layers: zero-out class=1 probability before softmax ----
+        # Mirrors infer_simple.py line 222-223: logits[:, 1, :lock_layers] = -inf
+        if self._lock_layers > 0:
+            logits_full[:, 1, :self._lock_layers] = float("-inf")
 
         prob_step = F.softmax(logits_step, dim=1)[:, 1]  # (B, 1)
         prob_full = F.softmax(logits_full, dim=1)[:, 1]  # (B, t)
