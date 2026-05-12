@@ -30,17 +30,16 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 # ---- Split ----
 SPLIT="${1:-test}"
 case "$SPLIT" in
-  train)  SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_train_split.json}"; OUTPUT_CSV="grid_diff_tcn/masked_v2/inference_results_train.csv" ;;
-  test)   SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_test_split.json}";  OUTPUT_CSV="grid_diff_tcn/masked_v2/inference_results_test.csv" ;;
-  val)    SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_val_split.json}";        OUTPUT_CSV="grid_diff_tcn/masked_v2/inference_results_val.csv" ;;
+  train)  SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_train_split_v2.json}"; OUTPUT_CSV="grid_diff_tcn/masked_v2/inference_results_train.csv"; OUTPUT_PROBS_CSV="grid_diff_tcn/masked_v2/probs_train.csv" ;;
+  test)   SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_test_split_v2.json}";  OUTPUT_CSV="grid_diff_tcn/masked_v2/inference_results_test.csv";   OUTPUT_PROBS_CSV="grid_diff_tcn/masked_v2/probs_test.csv" ;;
+  val)    SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_val_split_v2.json}";        OUTPUT_CSV="grid_diff_tcn/masked_v2/inference_results_val.csv";       OUTPUT_PROBS_CSV="grid_diff_tcn/masked_v2/probs_val.csv" ;;
   *)      echo "ERROR: split must be train|test|val, got '$SPLIT'"; exit 1 ;;
 esac
 
 # ---- 路径 ----
 CHECKPOINT="${CHECKPOINT:-grid_diff_tcn/masked_v2/checkpoints/stage2.pt}"
-ENCODER_CHECKPOINT="${ENCODER_CHECKPOINT:-grid_diff_tcn/masked_v2/checkpoints/stage1.pt}"
 ROI_CACHE_DIR="${ROI_CACHE_DIR:-data_drilling/roi_cache}"
-PRECOMPUTED_DIR="${PRECOMPUTED_DIR:-grid_diff_tcn/masked_v2/features_cache}"
+PRECOMPUTED_DIR="${PRECOMPUTED_DIR:-grid_diff_tcn/masked_v2/features_cache2}"
 
 # ---- DINOv3 ----
 DINOV3_MODEL="${DINOV3_MODEL:-vit_small}"
@@ -61,8 +60,8 @@ LOCK_LAYERS="${LOCK_LAYERS:-30}"
 S3WD_WAIT="${S3WD_WAIT:-3}"
 S3WD_THRESH="${S3WD_THRESH:-0.6}"
 S3WD_ACCEPT="${S3WD_ACCEPT:-0.7}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
 MAX_FRAMES="${MAX_FRAMES:-12}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"  # 空=全部
 
@@ -77,9 +76,9 @@ mkdir -p "$(dirname "${OUTPUT_CSV}")"
 ARGS=(
   --mode "$MODE"
   --checkpoint "$CHECKPOINT"
-  --encoder_checkpoint "$ENCODER_CHECKPOINT"
   --samples_info "$SAMPLES_INFO"
   --output_csv "$OUTPUT_CSV"
+  --output_probs_csv "$OUTPUT_PROBS_CSV"
   --decision_method "$DECISION"
   --lock_layers "$LOCK_LAYERS"
   --s3wd_wait "$S3WD_WAIT"
@@ -104,8 +103,7 @@ echo "Stage 2 Inference (infer_simple.py)"
 echo "split            : $SPLIT"
 echo "mode             : $MODE"
 echo "decision         : $DECISION"
-echo "checkpoint         : $CHECKPOINT"
-echo "encoder_checkpoint: $ENCODER_CHECKPOINT"
+echo "checkpoint       : $CHECKPOINT"
 echo "samples_info     : $SAMPLES_INFO"
 echo "output_csv       : $OUTPUT_CSV"
 echo "lock_layers      : $LOCK_LAYERS"

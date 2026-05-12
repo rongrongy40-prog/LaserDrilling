@@ -63,7 +63,7 @@ class MaskedPixelModel(nn.Module):
         dropout: float = 0.1,
         add_kl: bool = True,
         use_multiscale: bool = True,
-        freeze_encoder: bool = True,
+        freeze_encoder: bool = False,
         mask_ratio: float = 0.75,
         mask_shape: str = "circle",
         decoder_hidden_dim: int = 512,
@@ -96,7 +96,8 @@ class MaskedPixelModel(nn.Module):
                 image_size=int(dinov3_roi_size),
             )
 
-            # Standard MAE pre-trainer: frozen encoder + trainable MAE decoder
+            # MAE pre-trainer: encoder + decoder, both optionally trainable
+            # Direction B: encoder unfrozen → learns domain-adapted features
             self.mae_pretrainer = StandardMAEPreTrainer(
                 encoder=self.dinov3_extractor.backbone,
                 encoder_dim=int(dinov3_feat_dim),
@@ -106,6 +107,7 @@ class MaskedPixelModel(nn.Module):
                 decoder_dim=int(mae_decoder_dim),
                 decoder_depth=int(mae_decoder_depth),
                 decoder_heads=int(mae_decoder_heads),
+                freeze_encoder=self.freeze_encoder,
             )
         
         self.classifier = HierarchicalGridDiffProbTransformer(
@@ -316,8 +318,8 @@ class MaskedPixelModel(nn.Module):
     def set_encoder_trainable(self, trainable: bool) -> None:
         """
         Enable or disable encoder gradient.
-        Note: encoder is frozen by default (Standard MAE uses pretrained features).
-        Only the MAE decoder is trained in Stage 1.
+        Note: encoder trainability is controlled by freeze_encoder in __init__.
+        Direction B: encoder is trainable during Stage 1 for joint fine-tuning.
         """
         if hasattr(self, "dinov3_extractor"):
             for param in self.dinov3_extractor.parameters():

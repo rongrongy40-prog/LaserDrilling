@@ -20,9 +20,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ---- 数据 ----
-SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_test_split.json}"
-VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val_split.json}"
-OUTPUT_DIR="${OUTPUT_DIR:-grid_diff_tcn/masked_v2/features_cache}"
+SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_test_split_v2.json}"
+VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val_split_v2.json}"
+OUTPUT_DIR="${OUTPUT_DIR:-grid_diff_tcn/masked_v2/features_cache2}"
 
 # ---- DINOv3 ----
 DINOV3_MODEL="${DINOV3_MODEL:-vit_small}"

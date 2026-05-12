@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Standard MAE for self-supervised pre-training with frozen pretrained encoder.
+MAE for self-supervised pre-training with joint encoder-decoder fine-tuning.
 
 Architecture:
-  1. Full image → frozen encoder → all patch tokens (RoPE handles positions)
+  1. Full image → DINOv3 encoder → all patch tokens (RoPE handles positions)
   2. Replace masked patches with encoder's native [MASK] token
   3. MAE decoder: masked tokens → per-patch pixel reconstruction
   4. L1 loss between predicted and original masked pixels
 
 Key design:
-  - Encoder is FROZEN: we use its pretrained patch tokens directly
+  - Encoder is UNFROZEN during Stage 1: jointly fine-tuned to learn domain-adapted features
   - DINOv3's native [MASK] token is used for masked positions
   - MAE decoder learns to reconstruct masked pixels from visible patch features
-  - This gives encoder richer domain features while preserving pretrained quality
+  - Stage 2: encoder frozen, extract encoder features (384-dim) for classification
 """
 
 from __future__ import annotations
@@ -98,10 +98,11 @@ class MAEDecoder(nn.Module):
 
 class StandardMAEPreTrainer(nn.Module):
     """
-    Standard MAE pre-training using a frozen pretrained encoder.
+    MAE pre-training with joint encoder-decoder fine-tuning.
 
-    The encoder is NOT fine-tuned. The MAE decoder learns to reconstruct
-    masked patch pixels from the encoder's patch token features.
+    Both the encoder and the MAE decoder are trained together, so the encoder
+    learns domain-adapted features from the drilling data.
+    Stage 2 uses the encoder's output features for classification.
     """
 
     def __init__(
@@ -114,6 +115,7 @@ class StandardMAEPreTrainer(nn.Module):
         decoder_dim: int = 256,
         decoder_depth: int = 4,
         decoder_heads: int = 8,
+        freeze_encoder: bool = False,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -125,10 +127,15 @@ class StandardMAEPreTrainer(nn.Module):
         self.num_patches_per_side = image_size // patch_size
         self.num_patches = self.num_patches_per_side ** 2  # 196 for 224/16
 
-        # Freeze encoder entirely
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        self.encoder.eval()
+        # Optionally freeze encoder (set False for joint training in direction B)
+        if freeze_encoder:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+            self.encoder.eval()
+        else:
+            # Encoder is trainable — use smaller LR via param groups in optimizer
+            for param in self.encoder.parameters():
+                param.requires_grad = True
 
         # MAE decoder
         self.decoder = MAEDecoder(
@@ -270,6 +277,7 @@ def create_mae_pretrainer(
     decoder_dim: int = 256,
     decoder_depth: int = 4,
     decoder_heads: int = 8,
+    freeze_encoder: bool = False,
 ) -> StandardMAEPreTrainer:
     """Factory function to create an MAE pre-trainer."""
     return StandardMAEPreTrainer(
@@ -281,4 +289,5 @@ def create_mae_pretrainer(
         decoder_dim=decoder_dim,
         decoder_depth=decoder_depth,
         decoder_heads=decoder_heads,
+        freeze_encoder=freeze_encoder,
     )

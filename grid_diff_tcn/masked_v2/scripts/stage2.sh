@@ -13,12 +13,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # ---- 数据 ----
-SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_train_split.json}"
-VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val_split.json}"
+SAMPLES_INFO="${SAMPLES_INFO:-data_drilling/samples_info_train_split_v2.json}"
+VAL_SAMPLES_INFO="${VAL_SAMPLES_INFO:-data_drilling/samples_info_val_split_v2.json}"
 
 # 加速: 预裁剪 ROI 缓存 / 预计算特征
 CROP_CACHE_DIR="${CROP_CACHE_DIR:-data_drilling/roi_cache}"
-PRECOMPUTED_DIR="${PRECOMPUTED_DIR:-grid_diff_tcn/masked_v2/features_cache}"    # Stage1 encoder 提取的特征（可选，加速训练）
+PRECOMPUTED_DIR="${PRECOMPUTED_DIR:-grid_diff_tcn/masked_v2/features_cache2}"    # Stage1 encoder 提取的特征（可选，加速训练）
 
 # ---- DINOv3 ----
 DINOV3_MODEL="${DINOV3_MODEL:-vit_small}"

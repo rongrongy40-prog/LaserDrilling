@@ -1,6 +1,6 @@
 # ============================================================
-# Stage 1: Standard MAE 预训练 (masked_v2)
-#   encoder 冻结（使用原始预训练权重），仅训练 MAE decoder
+# Stage 1: MAE 预训练 (masked_v2)
+#   encoder UNFROZEN — encoder + MAE decoder 联合训练，encoder 学习领域适配特征
 #   相比旧版 CenterMask + CLS-only decoder，这是真正的标准 MAE
 # ============================================================
 
@@ -24,12 +24,13 @@ DINOV3_CHUNK_SIZE="${DINOV3_CHUNK_SIZE:-256}"
 D_MODEL="${D_MODEL:-128}"
 NHEAD="${NHEAD:-4}"
 NUM_LAYERS="${NUM_LAYERS:-2}"
-# encoder 始终冻结，仅训练 MAE decoder
-FREEZE_ENCODER="${FREEZE_ENCODER:-True}"
+# encoder 默认 unfreeze，encoder + decoder 联合训练
+FREEZE_ENCODER="${FREEZE_ENCODER:-False}"
+ENCODER_LR="${ENCODER_LR:-1e-6}"  # encoder lr (smaller, since pretrained)
 MASK_RATIO="${MASK_RATIO:-0.75}"
 
 # ---- 训练 ----
-BATCH_SIZE="${BATCH_SIZE:-2}" 
+BATCH_SIZE="${BATCH_SIZE:-2}"
 EPOCHS="${EPOCHS:-100}"
 LR="${LR:-1e-4}"                # MAE decoder lr
 PATIENCE="${PATIENCE:-8}"
@@ -57,7 +58,7 @@ MAE_DECODER_DEPTH="${MAE_DECODER_DEPTH:-4}"
 MAE_DECODER_HEADS="${MAE_DECODER_HEADS:-8}"
 
 # ---- 多卡 ----
-DEVICE_IDS="${DEVICE_IDS:-0 1}"
+DEVICE_IDS="${DEVICE_IDS:-0}"
 
 ARGS=(
   --samples_info "$SAMPLES_INFO"
@@ -72,10 +73,10 @@ ARGS=(
   --freeze_encoder "$FREEZE_ENCODER"
   --mask_ratio "$MASK_RATIO"
   --dinov3_chunk_size "$DINOV3_CHUNK_SIZE"
-  --accum_steps "$ACCUM_STEPS"
   --batch_size "$BATCH_SIZE"
   --epochs "$EPOCHS"
   --lr "$LR"
+  --encoder_lr "$ENCODER_LR"
   --patience "$PATIENCE"
   --num_workers "$NUM_WORKERS"
   --max_frames_per_layer "$MAX_FRAMES_PER_LAYER"
@@ -103,19 +104,20 @@ if [[ -n "$MAX_SAMPLES" ]]; then
 fi
 
 echo "=============================================="
-echo "Stage 1: Standard MAE Pre-training"
-echo "freeze_encoder  : $FREEZE_ENCODER"
-echo "mask_ratio     : $MASK_RATIO"
+echo "Stage 1: MAE Pre-training (joint encoder + decoder)"
+echo "freeze_encoder : $FREEZE_ENCODER"
+echo "encoder_lr     : $ENCODER_LR"
 echo "decoder_lr     : $LR"
+echo "mask_ratio     : $MASK_RATIO"
 echo "decoder_dim    : $MAE_DECODER_DIM"
 echo "decoder_depth  : $MAE_DECODER_DEPTH"
 echo "decoder_heads  : $MAE_DECODER_HEADS"
 echo "batch_size     : $BATCH_SIZE"
 echo "max_samples    : ${MAX_SAMPLES:-(all)}"
 echo "crop_cache_dir : $CROP_CACHE_DIR"
-echo "scheduler     : $STAGE1_SCHEDULER"
-echo "device_ids    : $DEVICE_IDS"
-echo "save          : $SAVE"
+echo "scheduler      : $STAGE1_SCHEDULER"
+echo "device_ids     : $DEVICE_IDS"
+echo "save           : $SAVE"
 echo "=============================================="
 cd "$REPO_ROOT"
 python3 -m grid_diff_tcn.masked_v2.train "${ARGS[@]}"

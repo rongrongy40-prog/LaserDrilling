@@ -177,6 +177,7 @@ def run_inference(
     lock_layers: int = 30,
     use_learned: bool = False,
     debug: bool = False,
+    output_probs_csv: str | None = None,
 ) -> tuple[List[dict], dict]:
     """
     Batch inference — 完全复刻 train.py evaluate_stage2()。
@@ -199,6 +200,7 @@ def run_inference(
     all_layer_lists: List[List[int]] = []
     all_sample_paths: List[str] = []
     all_frame_probs: List[tuple] = []   # only used by s3wd
+    all_layer_lists_stored: List[List[int]] = []
 
     with torch.inference_mode():
         for batch in tqdm(loader, desc="[Inference] Running model"):
@@ -238,6 +240,7 @@ def run_inference(
                     pt = probs[bi]
                     mask_t = frame_mask[bi].any(dim=1)
                     all_frame_probs.append((pt.cpu(), mask_t.cpu()))
+                    all_layer_lists_stored.append(ll)
                     if mask_t.sum() == 0:
                         all_preds.append(-1)
                         continue
@@ -303,6 +306,33 @@ def run_inference(
                 "decision_source": src,
             })
         metrics["csv_rows"] = csv_rows
+        # ---- Save probability curves ----
+        if output_probs_csv:
+            rows = []
+            for sp, true_l, pred_l, err, src, (pt, mask_t), ll in zip(
+                    all_sample_paths, all_pen_layers, csv_preds,
+                    [c["error"] for c in csv_rows], sources,
+                    all_frame_probs, all_layer_lists_stored):
+                for t_idx in range(len(pt)):
+                    rows.append({
+                        "sample": sp,
+                        "layer_idx": t_idx,
+                        "physical_layer": ll[t_idx] if t_idx < len(ll) else -1,
+                        "prob": pt[t_idx].item(),
+                        "is_valid": mask_t[t_idx].item(),
+                        "true_layer": true_l,
+                        "pred_layer": pred_l,
+                        "error": err,
+                        "decision_source": src,
+                    })
+            import csv as csvlib
+            with open(output_probs_csv, "w", newline="", encoding="utf-8") as f:
+                writer = csvlib.DictWriter(f, fieldnames=[
+                    "sample", "layer_idx", "physical_layer", "prob",
+                    "is_valid", "true_layer", "pred_layer", "error", "decision_source"])
+                writer.writeheader()
+                writer.writerows(rows)
+            print(f"[Inference] Probability curves saved to {output_probs_csv}")
         return csv_rows, metrics
 
     # ---- Build CSV rows (learned mode) ----
@@ -608,6 +638,8 @@ def main():
 
     # ---- 输出 ----
     parser.add_argument("--output_csv", type=str, default="inference_results.csv")
+    parser.add_argument("--output_probs_csv", type=str, default=None,
+                        help="保存每样本概率曲线到 CSV（用于绘图）")
 
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -868,6 +900,7 @@ def main():
         s3wd_accept=args.s3wd_accept,
         lock_layers=args.lock_layers,
         use_learned=(args.decision_method == "learned"),
+        output_probs_csv=args.output_probs_csv,
     )
 
     with open(args.output_csv, "w", newline="", encoding="utf-8") as f:

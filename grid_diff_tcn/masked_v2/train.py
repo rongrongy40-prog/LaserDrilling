@@ -337,22 +337,26 @@ def train_stage1(
     scaler: GradScaler | None = None,
     scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
 ) -> dict:
-    """Train stage 1: Standard MAE pre-training.
+    """Train stage 1: MAE pre-training with joint encoder + decoder training.
 
-    The pretrained encoder is FROZEN. Only the MAE decoder (Transformer + pixel head)
-    learns to reconstruct masked patches, giving encoder richer domain features.
+    By default, the encoder is UNFROZEN and jointly trained with the MAE decoder.
+    The encoder learns domain-adapted features from the pixel reconstruction task.
     Classifier is frozen (not used in Stage 1).
     """
-    # Freeze encoder: only MAE decoder trains
-    model.freeze_classifier()
-    model.set_encoder_trainable(False)
 
-    # Verify encoder is frozen
-    for name, param in model.named_parameters():
-        if "dinov3_extractor" in name or ("mae_pretrainer" in name and "encoder" in name):
-            if param.requires_grad:
-                print(f"  [Stage1] WARNING: encoder param {name} should be frozen but has grad")
-                param.requires_grad = False
+    model.freeze_classifier()
+    # Respect args.freeze_encoder: if True, freeze; if False, keep trainable (default direction B)
+    if getattr(args, "freeze_encoder", False):
+        model.set_encoder_trainable(False)
+        # Verify encoder is frozen
+        for name, param in model.named_parameters():
+            if "dinov3_extractor" in name or ("mae_pretrainer" in name and "encoder" in name):
+                if param.requires_grad:
+                    print(f"  [Stage1] WARNING: encoder param {name} should be frozen but has grad")
+                    param.requires_grad = False
+    else:
+        model.set_encoder_trainable(True)
+        print(f"  [Stage1] Encoder is TRAINABLE (joint training, encoder_lr={getattr(args, 'encoder_lr', 1e-6):.0e})")
 
     best_train_loss = float("inf")
     best_within5 = -1.0   # Stage2: save by within_5 metric, not val_loss
@@ -365,7 +369,7 @@ def train_stage1(
         epoch_loss = 0.0
         num_batches = 0
         optimizer.zero_grad()
-        
+
         pbar = tqdm(train_loader, desc=f"Stage1 Epoch {epoch+1}")
         for batch in pbar:
             frame_data = batch["frame_data"].to(device)  # (B, T, F, 3, H, W)
@@ -374,16 +378,16 @@ def train_stage1(
             F_frames = frame_data.shape[2]
             H = frame_data.shape[4]
             W = frame_data.shape[5]
-            
+
             # 整个 batch 一次前向：flatten (B,T,F,3,H,W) -> (B*T*F, 3, H, W)
             B, T, F_frames = frame_data.shape[0], frame_data.shape[1], frame_data.shape[2]
             chunk_flat = frame_data.reshape(B * T * F_frames, 3, H, W)
-            
+
             # Skip MAE for incomplete batches (size must be divisible by num_patches=196)
             mae_patches = getattr(model, "mae_pretrainer", None)
             if mae_patches is not None and chunk_flat.shape[0] % mae_patches.num_patches != 0:
                 continue
-            
+
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
                     result = model.forward_stage1(chunk_flat)
@@ -393,7 +397,7 @@ def train_stage1(
                 result = model.forward_stage1(chunk_flat)
                 loss = result["loss"]
                 loss.backward()
-            
+
             if scaler is not None:
                 scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -403,7 +407,7 @@ def train_stage1(
             else:
                 optimizer.step()
             optimizer.zero_grad()
-            
+
             epoch_loss += loss.item()
             num_batches += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
@@ -1166,8 +1170,10 @@ def main():
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--num_layers", type=int, default=2)
     
-    parser.add_argument("--freeze_encoder", type=lambda x: x.lower() == "true", default=True,
-                        help="[v2] Freeze DINOv3 encoder during training. Default True (encoder stays pretrained).")
+    parser.add_argument("--freeze_encoder", type=lambda x: x.lower() == "true", default=False,
+                        help="[v2] Freeze DINOv3 encoder during training. "
+                             "Default False: encoder jointly fine-tuned with MAE decoder in Stage 1, "
+                             "learning domain-adapted features. Set True to keep encoder frozen.")
     parser.add_argument("--mask_ratio", type=float, default=0.75)
 
     # MAE decoder 参数
@@ -1193,8 +1199,6 @@ def main():
     parser.add_argument("--max_frames_per_layer", type=int, default=8)
     parser.add_argument("--dinov3_chunk_size", type=int, default=4,
                         help="Number of images processed by DINOv3 at once (lower = less GPU memory)")
-    parser.add_argument("--accum_steps", type=int, default=4,
-                        help="Gradient accumulation steps for Stage 1")
     parser.add_argument("--precomputed_dir", type=str, default=None,
                         help="Directory with pre-extracted DINOv3 features (.pt per sample). "
                              "Must be used together with --use_cached_features. "
@@ -1426,12 +1430,12 @@ def main():
 
     # Create optimizer: strategy depends on stage and encoder freeze setting
     if args.stage == 1:
-        # Stage 1: Standard MAE - encoder is FROZEN, only MAE decoder trains
+        # Stage 1: Joint MAE training - encoder + MAE decoder both trainable (default)
+        # Encoder learns domain-adapted features; decoder learns to reconstruct masked pixels.
         # (classifier is also frozen)
         encoder_params = []
         decoder_params = []
         for name, param in model.named_parameters():
-            # mae_pretrainer includes both encoder (frozen) and decoder (trainable)
             if "dinov3" in name or (hasattr(model, "mae_pretrainer") and "mae_pretrainer.encoder" in name):
                 encoder_params.append(param)
             elif "mae_pretrainer" in name:
@@ -1442,17 +1446,17 @@ def main():
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         print(f"  [Stage1] Total params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M, "
               f"trainable: {sum(p.numel() for p in trainable_params) / 1e6:.1f}M "
-              f"(encoder frozen, MAE decoder trainable)")
+              f"(encoder lr={args.encoder_lr}, decoder lr={args.lr})")
 
-        if encoder_params and any(p.requires_grad for p in encoder_params):
-            # Encoder is trainable (shouldn't happen with freeze_encoder=True, but handle gracefully)
+        if args.freeze_encoder:
+            # Encoder frozen — only MAE decoder trains
             optimizer = torch.optim.AdamW([
-                {"params": [p for p in encoder_params if p.requires_grad], "lr": args.encoder_lr},
                 {"params": decoder_params, "lr": args.lr},
             ], weight_decay=0.01)
         else:
-            # Encoder frozen - only MAE decoder trains
+            # Encoder unfrozen — joint training with different LRs
             optimizer = torch.optim.AdamW([
+                {"params": [p for p in encoder_params if p.requires_grad], "lr": args.encoder_lr},
                 {"params": decoder_params, "lr": args.lr},
             ], weight_decay=0.01)
         s1_scheduler_cfg = getattr(args, "stage1_scheduler", "cosine")

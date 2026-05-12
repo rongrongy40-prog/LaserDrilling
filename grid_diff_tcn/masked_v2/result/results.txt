@@ -24,3 +24,9 @@
   pct_over_10:  6.3%
 
 
+[Inference] CSV saved to inference_results_test.csv
+[Inference] Decision=s3wd  n=383
+  pct_within_3: 87.2%
+  pct_within_5: 97.1%
+  pct_over_10:  1.0%
+
